@@ -1,0 +1,13 @@
+From: billing@acme-cloud.com
+Subject: Invoice #4471 - payment due Aug 31
+
+Hi Mirek,
+
+This is a reminder that invoice #4471 for 128,000 JPY is due on August 31, 2026.
+Please arrange payment before the deadline to avoid a 5% late fee.
+
+If you have already paid, kindly ignore this message.
+
+Best regards,
+Sarah Tanaka
+ACME Cloud Billing
