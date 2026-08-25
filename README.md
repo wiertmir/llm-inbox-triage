@@ -25,11 +25,12 @@ Given raw text, it returns:
 
 It touches everything required at the LLM fundamentals stage:
 
-- **LLM APIs** — OpenAI and Anthropic
-- **Structured output** — reliable JSON, not free text
+- **LLM APIs** — OpenAI (Responses API) and Anthropic
+- **Structured Outputs** — a Pydantic schema the API *guarantees*, not "please return JSON" + `json.loads` and a prayer
 - **Function calling / tools** — optionally act on extracted data (e.g. add a detected meeting to a calendar)
-- **Prompt engineering** — a system prompt that enforces the output contract
-- **Production hygiene** — error handling, retries, cost awareness
+- **Prompt engineering** — a short system prompt describing the *task*, while the schema enforces the *shape*
+- **Evals** — a mini eval harness that measures categorization accuracy (the 2026 differentiator)
+- **Production hygiene** — error handling, retries, refusal handling, cost awareness
 - **Multi-provider** — same logic runs on OpenAI *and* Anthropic
 
 It's also the seed for later projects: add RAG (Project 2) so it knows the context of past mail, then turn it into an agent (Project 3).
@@ -44,7 +45,7 @@ cd llm-inbox-triage
 # 2. Install
 pip install -r requirements.txt
 
-# 3. Set your API key(s)
+# 3. Set your API key(s) — never hardcode them; .env is gitignored
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 
@@ -58,15 +59,16 @@ See the [Issues](https://github.com/wiertmir/llm-inbox-triage/issues) tab. MVP f
 
 **MVP:**
 - [ ] Read text from file / stdin
-- [ ] System prompt → structured JSON output
+- [ ] **Structured Outputs**: Pydantic `TriageResult` via `responses.parse` (OpenAI) — schema guaranteed, no `json.loads`
 - [ ] Works on OpenAI and Anthropic (`--provider` flag)
 - [ ] Pretty terminal output + JSON export
-- [ ] README with example + lessons learned
+- [ ] **Mini-eval**: 10–20 sample messages with expected output, measure categorization accuracy
+- [ ] README with example + lessons learned + eval results
 
 **Later:**
 - [ ] Function calling: auto-add detected meetings to calendar
 - [ ] Batch mode (process a folder of messages)
-- [ ] Simple eval harness (10 sample messages, check categorization)
+- [ ] Refusal / safety handling surfaced cleanly
 
 ## 📝 License
 
