@@ -25,7 +25,10 @@ import sys
 from enum import Enum
 
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+from openai import OpenAI
+from openai.types.responses import ParsedResponse, ResponseInputParam
 
 # TODO: load .env (python-dotenv) so API keys are picked up automatically
 # from dotenv import load_dotenv
@@ -63,12 +66,17 @@ class TriageResult(BaseModel):
     )
     extracted: Extracted
 
+class TriageRefusal(Exception):
+    """The model declined or produced no structured output."""
+
 
 # Note how short the system prompt is now: we no longer beg for JSON formatting.
 # The schema does that job. We only describe the *task* and the *judgement*.
 SYSTEM_PROMPT = """You are an inbox triage assistant. Analyse the message and fill in
 the structured fields. Be conservative with priority; reserve 5 for genuinely
 time-critical items. If a field has no data, use an empty list or null."""
+
+OPENAI_MODEL = "gpt-5.6"
 
 
 # ---------------------------------------------------------------------------
@@ -100,20 +108,47 @@ def read_input(path: str | None) -> str:
 # 3. PROVIDERS  (both return a validated TriageResult, not a raw dict)
 # ---------------------------------------------------------------------------
 
+def _refusal_text(response: ParsedResponse[TriageResult]) -> str | None:
+    for output in response.output:
+        if output.type != "message":
+            continue
+
+        for part in output.content:
+            if part.type == "refusal":
+                return part.refusal
+
+    return None
+
 def triage_openai(text: str) -> TriageResult:
     """Call OpenAI with Structured Outputs and return a validated TriageResult."""
-    # TODO: from openai import OpenAI; client = OpenAI()
-    # TODO: response = client.responses.parse(
-    #           model="gpt-5.6",           # or a current model you have access to
-    #           input=[
-    #               {"role": "system", "content": SYSTEM_PROMPT},
-    #               {"role": "user", "content": text},
-    #           ],
-    #           text_format=TriageResult,  # <-- schema is guaranteed
-    #       )
-    # TODO: handle response.output_parsed being None (a refusal) gracefully
-    # TODO: return response.output_parsed
-    raise NotImplementedError("triage_openai")
+    logger.info("Using OpenAI provider")
+    client = OpenAI()
+    logger.debug("OpenAI base URL: {url}", url=client.base_url)
+
+    messages: ResponseInputParam = [
+        {'role': 'system', 'content': SYSTEM_PROMPT},
+        {'role': 'user', 'content': text},
+    ]
+
+    logger.info("Using AI model: {model}", model=OPENAI_MODEL)
+    try:
+        response = client.responses.parse(
+            model=OPENAI_MODEL,
+            input=messages,
+            text_format=TriageResult
+        )
+    except ValidationError as exc:
+        logger.error("OpenAI output does not match TriageResult: {error}", error=exc)
+        raise
+
+    parsed = response.output_parsed
+    if parsed is None:
+        reason = _refusal_text(response)
+        if reason:
+            raise TriageRefusal(f"Model refused: {reason}")
+        raise TriageRefusal("Model refused or returned no structured output")
+    
+    return parsed
 
 
 def triage_anthropic(text: str) -> TriageResult:
@@ -169,11 +204,11 @@ def main() -> int:
     except FileNotFoundError:
         parser.error(f"File not found: {args.path}")        
 
-    # TODO: add basic error handling + a retry on transient API errors
-    if args.provider == "openai":
-        result = triage_openai(text)
-    else:
-        result = triage_anthropic(text)
+    try:
+        result = triage_openai(text) if args.provider == "openai" else triage_anthropic(text)
+    except TriageRefusal as exc:
+        logger.error("{}", exc)
+        return 1
 
     if args.json:
         print(result.model_dump_json(indent=2))

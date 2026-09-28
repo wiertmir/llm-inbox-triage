@@ -1,0 +1,403 @@
+"""Tests for issue #2 — MVP: OpenAI provider with Structured Outputs (Pydantic).
+
+Acceptance criteria from the issue:
+  - Use the OpenAI Python SDK with the Responses API.
+  - The output shape is the Pydantic model `TriageResult`.
+  - Call `client.responses.parse(model=..., input=[system, user], text_format=TriageResult)`.
+  - Return `response.output_parsed` (already validated, no `json.loads`).
+  - Handle `output_parsed is None` (a safety refusal) gracefully.
+
+The OpenAI client is replaced with a fake, so no network or API key is needed.
+The fake is patched in as both `openai.OpenAI` and `triage.OpenAI`, so either
+`from openai import OpenAI` (module or function level) or `openai.OpenAI()` works.
+
+Live test (optional, costs a few tokens):
+    OPENAI_LIVE_TEST=1 OPENAI_API_KEY=sk-... pytest -v -k live
+
+Run with:  pytest -v
+"""
+
+import inspect
+import io
+import json
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from pydantic import BaseModel, ValidationError
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import triage  # noqa: E402
+
+openai = pytest.importorskip("openai")
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+def make_result(**overrides) -> triage.TriageResult:
+    data = dict(
+        category=triage.Category.invoice,
+        priority=4,
+        summary="Invoice #4471 is overdue and must be paid by Friday.",
+        suggested_reply="Thanks, we will pay invoice #4471 by Friday.",
+        extracted=triage.Extracted(
+            dates=["2026-09-25"],
+            amounts=["$1,250.00"],
+            names=["Sarah Tanaka"],
+            deadlines=["Friday"],
+        ),
+    )
+    data.update(overrides)
+    return triage.TriageResult(**data)
+
+
+def parsed_response(result):
+    # output_text is deliberately not JSON: the code must use output_parsed,
+    # not re-parse the raw text the old way.
+    return SimpleNamespace(
+        output_parsed=result,
+        output_text="<<not json - use output_parsed>>",
+        output=[
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                content=[SimpleNamespace(type="output_text", text="<<not json>>", parsed=result)],
+            )
+        ],
+    )
+
+
+REFUSAL_TEXT = "I'm sorry, I can't help with that request."
+
+
+def refusal_response():
+    return SimpleNamespace(
+        output_parsed=None,
+        output_text="",
+        output=[
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                content=[SimpleNamespace(type="refusal", refusal=REFUSAL_TEXT)],
+            )
+        ],
+    )
+
+
+def empty_response():
+    """output_parsed is None and there is no refusal block (e.g. incomplete output)."""
+    return SimpleNamespace(output_parsed=None, output_text="", output=[])
+
+
+class _Responses:
+    def __init__(self, owner):
+        self._owner = owner
+
+    def parse(self, **kwargs):
+        self._owner.parse_calls.append(kwargs)
+        return self._owner.response
+
+    def create(self, **kwargs):
+        raise AssertionError("Use responses.parse(text_format=...), not responses.create()")
+
+
+class _Chat:
+    @property
+    def completions(self):
+        raise AssertionError("Use the Responses API, not chat.completions (old pattern)")
+
+
+class FakeOpenAI:
+    """Stand-in for openai.OpenAI that records calls to responses.parse."""
+
+    instances: list["FakeOpenAI"] = []
+    response = None
+
+    def __init__(self, *args, **kwargs):
+        self.init_kwargs = kwargs
+        self.base_url = "https://api.openai.com/v1/"
+        self.parse_calls: list[dict] = []
+        self.response = type(self).response
+        self.responses = _Responses(self)
+        self.chat = _Chat()
+        type(self).instances.append(self)
+
+    @classmethod
+    def all_parse_calls(cls):
+        return [call for inst in cls.instances for call in inst.parse_calls]
+
+
+@pytest.fixture
+def fake_openai(monkeypatch):
+    """Patch the OpenAI client; set `fake_openai.response` to control the reply."""
+
+    class Fake(FakeOpenAI):
+        instances = []
+        response = parsed_response(make_result())
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-a-real-key")
+    monkeypatch.setattr(openai, "OpenAI", Fake)
+    monkeypatch.setattr(triage, "OpenAI", Fake, raising=False)
+    return Fake
+
+
+def single_parse_call(fake):
+    calls = fake.all_parse_calls()
+    assert len(calls) == 1, f"expected exactly one responses.parse() call, got {len(calls)}"
+    return calls[0]
+
+
+# ---------------------------------------------------------------------------
+# 1. The schema: TriageResult is a Pydantic model usable with Structured Outputs
+# ---------------------------------------------------------------------------
+
+def test_triage_result_is_pydantic_model():
+    assert issubclass(triage.TriageResult, BaseModel)
+
+
+def test_schema_has_expected_fields():
+    fields = set(triage.TriageResult.model_fields)
+    assert fields == {"category", "priority", "summary", "suggested_reply", "extracted"}
+    assert set(triage.Extracted.model_fields) == {"dates", "amounts", "names", "deadlines"}
+
+
+def test_schema_converts_to_openai_strict_json_schema():
+    """responses.parse() converts the model to a strict schema; it must not choke on it."""
+    from openai.lib._pydantic import to_strict_json_schema
+
+    schema = to_strict_json_schema(triage.TriageResult)
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+
+
+@pytest.mark.parametrize("priority", [0, 6, -1])
+def test_priority_out_of_range_rejected(priority):
+    with pytest.raises(ValidationError):
+        make_result(priority=priority)
+
+
+@pytest.mark.parametrize("priority", [1, 3, 5])
+def test_priority_in_range_accepted(priority):
+    assert make_result(priority=priority).priority == priority
+
+
+def test_hallucinated_category_rejected():
+    with pytest.raises(ValidationError):
+        triage.TriageResult.model_validate(
+            {**make_result().model_dump(), "category": "super-urgent"}
+        )
+
+
+def test_suggested_reply_may_be_null():
+    assert make_result(suggested_reply=None).suggested_reply is None
+
+
+def test_extracted_defaults_to_empty_lists():
+    e = triage.Extracted()
+    assert (e.dates, e.amounts, e.names, e.deadlines) == ([], [], [], [])
+
+
+# ---------------------------------------------------------------------------
+# 2. triage_openai() calls responses.parse correctly
+# ---------------------------------------------------------------------------
+
+def test_calls_responses_parse_once(fake_openai):
+    triage.triage_openai("hello")
+
+    single_parse_call(fake_openai)
+
+
+def test_passes_triage_result_as_text_format(fake_openai):
+    triage.triage_openai("hello")
+
+    assert single_parse_call(fake_openai)["text_format"] is triage.TriageResult
+
+
+def test_passes_a_model_name(fake_openai):
+    triage.triage_openai("hello")
+
+    model = single_parse_call(fake_openai).get("model")
+    assert isinstance(model, str) and model.strip()
+
+
+def test_input_is_system_then_user(fake_openai):
+    message = "Subject: Invoice #4471\n\nPlease pay by Friday."
+
+    triage.triage_openai(message)
+
+    messages = single_parse_call(fake_openai)["input"]
+    assert isinstance(messages, list) and len(messages) == 2
+    system, user = messages
+    assert system["role"] in ("system", "developer")
+    assert system["content"] == triage.SYSTEM_PROMPT
+    assert user["role"] == "user"
+    assert user["content"] == message
+
+
+def test_user_text_is_passed_verbatim(fake_openai):
+    message = "Zażółć gęślą jaźń — 請求書 — {\"not\": \"a template\"} — <b>"
+
+    triage.triage_openai(message)
+
+    user = single_parse_call(fake_openai)["input"][-1]
+    assert user["content"] == message
+
+
+def test_system_prompt_does_not_beg_for_json():
+    """The schema enforces the shape; the prompt should only describe the task."""
+    prompt = triage.SYSTEM_PROMPT.lower()
+    assert "strict json" not in prompt
+    assert "json and nothing else" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# 3. triage_openai() returns response.output_parsed
+# ---------------------------------------------------------------------------
+
+def test_returns_triage_result(fake_openai):
+    result = triage.triage_openai("hello")
+
+    assert isinstance(result, triage.TriageResult)
+
+
+def test_returns_output_parsed_unchanged(fake_openai):
+    expected = make_result(category=triage.Category.urgent, priority=5, summary="Server down.")
+    fake_openai.response = parsed_response(expected)
+
+    result = triage.triage_openai("prod is down!")
+
+    assert result == expected
+
+
+def test_does_not_reparse_output_text(fake_openai):
+    """output_text is garbage in the fake; success proves it was not json.loads()'d."""
+    result = triage.triage_openai("hello")
+
+    assert result.summary == make_result().summary
+
+
+def test_source_has_no_json_loads():
+    src = inspect.getsource(triage.triage_openai)
+    assert "json.loads" not in src
+    assert "model_validate_json" not in src
+
+
+# ---------------------------------------------------------------------------
+# 4. Refusal: output_parsed is None -> handled gracefully
+#
+# The issue leaves the mechanism open. These tests require that triage_openai()
+# does NOT return None and does NOT crash with an incidental error
+# (AttributeError, TypeError, ...). Raising a deliberate exception whose
+# message mentions the refusal is the expected behaviour.
+# ---------------------------------------------------------------------------
+
+ACCIDENTAL_ERRORS = (AttributeError, TypeError, KeyError, IndexError, NotImplementedError)
+
+
+@pytest.mark.parametrize("response_factory", [refusal_response, empty_response])
+def test_none_output_parsed_does_not_return_none(fake_openai, response_factory):
+    fake_openai.response = response_factory()
+
+    try:
+        result = triage.triage_openai("something the model refuses")
+    except ACCIDENTAL_ERRORS as exc:
+        pytest.fail(f"Refusal crashed with an incidental {type(exc).__name__}: {exc}")
+    except Exception:
+        return  # a deliberate, meaningful error is fine
+    assert result is not None, "triage_openai() must not silently return None on refusal"
+    assert isinstance(result, triage.TriageResult)
+
+
+def test_refusal_error_is_explicit(fake_openai):
+    fake_openai.response = refusal_response()
+
+    with pytest.raises(Exception) as excinfo:
+        triage.triage_openai("something the model refuses")
+
+    assert not isinstance(excinfo.value, ACCIDENTAL_ERRORS), (
+        f"Refusal should raise a deliberate error, got {type(excinfo.value).__name__}"
+    )
+    msg = str(excinfo.value)
+    assert "refus" in msg.lower() or REFUSAL_TEXT in msg, (
+        f"Error should say the model refused; got: {msg!r}"
+    )
+
+
+def test_cli_refusal_exits_cleanly(fake_openai, monkeypatch, capsys):
+    """`python triage.py` on a refused message -> non-zero exit, message, no JSON, no traceback."""
+    fake_openai.response = refusal_response()
+    monkeypatch.setattr(sys, "argv", ["triage.py", "--provider", "openai", "--json"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("something the model refuses"))
+
+    try:
+        code = triage.main()
+    except SystemExit as exc:
+        code = exc.code
+    except Exception as exc:
+        pytest.fail(f"main() let a {type(exc).__name__} escape on refusal: {exc}")
+
+    out, err = capsys.readouterr()
+    assert code not in (0, None), "refusal should produce a non-zero exit code"
+    assert out.strip() == "", f"nothing should be printed to stdout on refusal, got: {out!r}"
+    assert "refus" in err.lower() or REFUSAL_TEXT in err
+
+
+# ---------------------------------------------------------------------------
+# 5. End-to-end through main() with the fake client
+# ---------------------------------------------------------------------------
+
+def run_main(monkeypatch, capsys, argv, stdin=""):
+    monkeypatch.setattr(sys, "argv", ["triage.py", *argv])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+    code = triage.main()
+    return code, capsys.readouterr()
+
+
+def test_openai_is_default_provider(fake_openai, monkeypatch, capsys):
+    code, _ = run_main(monkeypatch, capsys, ["--json"], stdin="hello")
+
+    assert code == 0
+    single_parse_call(fake_openai)
+
+
+def test_main_json_output_matches_schema(fake_openai, monkeypatch, capsys):
+    code, captured = run_main(
+        monkeypatch, capsys, ["--provider", "openai", "--json", str(ROOT / "sample.txt")]
+    )
+
+    assert code == 0
+    data = json.loads(captured.out)
+    assert triage.TriageResult.model_validate(data) == make_result()
+
+
+def test_main_sends_file_contents_to_openai(fake_openai, monkeypatch, capsys):
+    run_main(monkeypatch, capsys, ["--provider", "openai", "--json", str(ROOT / "sample.txt")])
+
+    user = single_parse_call(fake_openai)["input"][-1]
+    assert "Invoice #4471" in user["content"]
+
+
+# ---------------------------------------------------------------------------
+# 6. Optional live test against the real API
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not (os.getenv("OPENAI_LIVE_TEST") and os.getenv("OPENAI_API_KEY")),
+    reason="set OPENAI_LIVE_TEST=1 and OPENAI_API_KEY to call the real API",
+)
+def test_live_openai_on_sample():
+    text = (ROOT / "sample.txt").read_text(encoding="utf-8")
+
+    result = triage.triage_openai(text)
+
+    assert isinstance(result, triage.TriageResult)
+    assert result.category == triage.Category.invoice
+    assert 1 <= result.priority <= 5
+    assert result.summary.strip()
