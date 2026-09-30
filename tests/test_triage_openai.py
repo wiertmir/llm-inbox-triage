@@ -22,8 +22,10 @@ import io
 import json
 import os
 import sys
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -41,16 +43,16 @@ openai = pytest.importorskip("openai")
 # ---------------------------------------------------------------------------
 
 def make_result(**overrides) -> triage.TriageResult:
-    data = dict(
+    data: dict[str, Any] = dict(
         category=triage.Category.invoice,
         priority=4,
         summary="Invoice #4471 is overdue and must be paid by Friday.",
         suggested_reply="Thanks, we will pay invoice #4471 by Friday.",
         extracted=triage.Extracted(
-            dates=["2026-09-25"],
-            amounts=["$1,250.00"],
+            dates=[date(2026, 9, 25)],
+            amounts=[triage.Money(amount=1250.0, currency="USD")],
             names=["Sarah Tanaka"],
-            deadlines=["Friday"],
+            deadlines=[date(2026, 9, 25)],
         ),
     )
     data.update(overrides)
@@ -204,6 +206,67 @@ def test_extracted_defaults_to_empty_lists():
     assert (e.dates, e.amounts, e.names, e.deadlines) == ([], [], [], [])
 
 
+def test_extracted_coerces_json_values():
+    """The API returns JSON: ISO date strings and numbers become date / Money."""
+    e = triage.Extracted.model_validate(
+        {
+            "dates": ["2026-08-31"],
+            "amounts": [{"amount": 128000, "currency": "JPY"}, {"amount": "1250.50", "currency": "USD"}],
+            "deadlines": ["2026-09-25"],
+        }
+    )
+
+    assert e.dates == [date(2026, 8, 31)]
+    assert e.amounts == [
+        triage.Money(amount=128000.0, currency="JPY"),
+        triage.Money(amount=1250.5, currency="USD"),
+    ]
+    assert e.deadlines == [date(2026, 9, 25)]
+
+
+def test_money_currency_defaults_to_default_ccy():
+    assert triage.Money(amount=5000).currency == triage.DEFAULT_CCY
+    assert triage.Money.model_validate({"amount": 5000}).currency == triage.DEFAULT_CCY
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("dates", "Friday"),
+        ("dates", "August 31, 2026"),
+        ("deadlines", "end of month"),
+        ("amounts", "128,000 JPY"),
+        ("amounts", 1250.0),
+        ("amounts", {"amount": "$1,250.00", "currency": "USD"}),
+        ("amounts", {"currency": "USD"}),
+    ],
+)
+def test_extracted_rejects_non_iso_dates_and_bad_amounts(field, value):
+    with pytest.raises(ValidationError):
+        triage.Extracted.model_validate({field: [value]})
+
+
+def test_schema_declares_date_and_money_types():
+    schema = triage.Extracted.model_json_schema()
+    props = schema["properties"]
+
+    assert props["dates"]["items"] == {"type": "string", "format": "date"}
+    assert props["deadlines"]["items"] == {"type": "string", "format": "date"}
+    money = schema["$defs"]["Money"]["properties"]
+    assert money["amount"]["type"] == "number"
+    assert money["currency"]["type"] == "string"
+
+
+def test_money_default_is_kept_out_of_strict_schema():
+    """Strict mode requires every field, so a `default` in the API schema is meaningless."""
+    from openai.lib._pydantic import to_strict_json_schema
+
+    money = to_strict_json_schema(triage.TriageResult)["$defs"]["Money"]
+
+    assert "default" not in money["properties"]["currency"]
+    assert set(money["required"]) == {"amount", "currency"}
+
+
 # ---------------------------------------------------------------------------
 # 2. triage_openai() calls responses.parse correctly
 # ---------------------------------------------------------------------------
@@ -255,6 +318,17 @@ def test_system_prompt_does_not_beg_for_json():
     prompt = triage.SYSTEM_PROMPT.lower()
     assert "strict json" not in prompt
     assert "json and nothing else" not in prompt
+
+
+def test_system_prompt_asks_to_resolve_relative_dates():
+    prompt = triage.SYSTEM_PROMPT
+    assert "YYYY-MM-DD" in prompt
+    assert "Friday" in prompt
+    assert date.today().isoformat() in prompt, "the model needs today's date to resolve 'Friday'"
+
+
+def test_system_prompt_names_default_currency():
+    assert triage.DEFAULT_CCY in triage.SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------

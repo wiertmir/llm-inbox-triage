@@ -23,12 +23,19 @@ import argparse
 import os
 import sys
 from enum import Enum
+from datetime import date
 
 from loguru import logger
+
 from pydantic import BaseModel, Field, ValidationError
+from pydantic.config import JsonDict
+from typing import Iterable
 
 from openai import OpenAI
 from openai.types.responses import ParsedResponse, ResponseInputParam
+
+from anthropic import Anthropic
+from anthropic.types import MessageParam
 
 # TODO: load .env (python-dotenv) so API keys are picked up automatically
 # from dotenv import load_dotenv
@@ -40,6 +47,9 @@ from openai.types.responses import ParsedResponse, ResponseInputParam
 #    Define the shape once, in code. The API will guarantee the model obeys it.
 # ---------------------------------------------------------------------------
 
+DEFAULT_CCY = "JPY"
+
+
 class Category(str, Enum):
     urgent = "urgent"
     invoice = "invoice"
@@ -50,11 +60,31 @@ class Category(str, Enum):
     other = "other"
 
 
+def _drop_default(schema: JsonDict) -> None:
+    # Strict schemas make every field required, so keep the default out of the API schema.
+    schema.pop("default", None)
+
+
+class Money(BaseModel):
+    amount: float = Field(description="Numeric value, e.g. 128000 for '128,000 JPY'")
+    currency: str = Field(
+        default=DEFAULT_CCY,
+        description=f"ISO 4217 code, e.g. USD, EUR; {DEFAULT_CCY} if the message names none",
+        json_schema_extra=_drop_default,
+    )
+
+
 class Extracted(BaseModel):
-    dates: list[str] = Field(default_factory=list, description="ISO or human dates found")
-    amounts: list[str] = Field(default_factory=list, description="Money amounts found")
+    dates: list[date] = Field(
+        default_factory=list,
+        description="Dates mentioned, as YYYY-MM-DD; resolve relative dates like 'Friday'",
+    )
+    amounts: list[Money] = Field(default_factory=list, description="Money amounts found")
     names: list[str] = Field(default_factory=list, description="People / companies mentioned")
-    deadlines: list[str] = Field(default_factory=list, description="Explicit deadlines")
+    deadlines: list[date] = Field(
+        default_factory=list,
+        description="Explicit deadlines, as YYYY-MM-DD; resolve relative dates like 'Friday'",
+    )
 
 
 class TriageResult(BaseModel):
@@ -72,11 +102,20 @@ class TriageRefusal(Exception):
 
 # Note how short the system prompt is now: we no longer beg for JSON formatting.
 # The schema does that job. We only describe the *task* and the *judgement*.
-SYSTEM_PROMPT = """You are an inbox triage assistant. Analyse the message and fill in
+SYSTEM_PROMPT = f"""You are an inbox triage assistant. Analyse the message and fill in
 the structured fields. Be conservative with priority; reserve 5 for genuinely
-time-critical items. If a field has no data, use an empty list or null."""
+time-critical items. If a field has no data, use an empty list or null.
+
+Write every date as YYYY-MM-DD. Convert relative or partial dates such as "Friday",
+"tomorrow" or "end of the month" to the actual calendar date, counting from the
+message's sent date if it has one, otherwise from today ({date.today().isoformat()}).
+Leave out dates you cannot pin down.
+
+For amounts, give the number and its ISO 4217 currency code; use {DEFAULT_CCY} if the
+message does not name a currency."""
 
 OPENAI_MODEL = "gpt-5.6"
+ANTHROPIC_MODEL = "claude-sonnet-5-5"
 
 
 # ---------------------------------------------------------------------------
@@ -153,16 +192,36 @@ def triage_openai(text: str) -> TriageResult:
 
 def triage_anthropic(text: str) -> TriageResult:
     """Call Anthropic and return a validated TriageResult.
-
-    Anthropic has no responses.parse helper, so the idiomatic way is a tool whose
-    input_schema is TriageResult's JSON schema (TriageResult.model_json_schema()),
-    force the model to call it, then validate the tool input with Pydantic.
     """
-    # TODO: import anthropic; client = anthropic.Anthropic()
-    # TODO: build a single tool from TriageResult.model_json_schema()
-    # TODO: client.messages.create(..., tools=[tool], tool_choice={"type": "tool", "name": ...})
-    # TODO: pull the tool_use block's input and do TriageResult.model_validate(input)
-    raise NotImplementedError("triage_anthropic")
+    logger.info("Using Anthropic provider")
+    client = Anthropic()
+    logger.debug("Anthropic base URL: {url}", url=client.base_url)
+
+    messages: Iterable[MessageParam] = [
+        {'role': 'user', 'content': text}
+    ]
+
+    logger.info("Using AI model: {model}", model=ANTHROPIC_MODEL)
+
+    response = client.messages.parse(
+        model=ANTHROPIC_MODEL,
+        system=SYSTEM_PROMPT,
+        max_tokens=1024,
+        messages=messages,
+        output_format=TriageResult
+    )
+
+    if response.stop_reason == "refusal":
+        reason = "".join(block.text for block in response.content if block.type == "text")
+        raise TriageRefusal(f"Model refused: {reason}" if reason else "Model refused the request")
+
+    parsed = response.parsed_output
+    if parsed is None:
+        raise TriageRefusal(
+            f"Model returned no structured output (stop_reason={response.stop_reason})"
+        )
+
+    return parsed
 
 
 # ---------------------------------------------------------------------------
