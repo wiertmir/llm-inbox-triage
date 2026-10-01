@@ -1,0 +1,25 @@
+{
+  "category": "invoice",
+  "priority": 3,
+  "summary": "ACME Cloud reminds Mirek that invoice #4471 for JPY 128,000 is due August 31, 2026, after which a 5% late fee may apply.",
+  "suggested_reply": "Hi Sarah,\n\nThank you for the reminder. We’ll arrange payment of invoice #4471 before August 31, 2026.\n\nBest,\nMirek",
+  "extracted": {
+    "dates": [
+      "2026-08-31"
+    ],
+    "amounts": [
+      {
+        "amount": 128000.0,
+        "currency": "JPY"
+      }
+    ],
+    "names": [
+      "Mirek",
+      "Sarah Tanaka",
+      "ACME Cloud Billing"
+    ],
+    "deadlines": [
+      "2026-08-31"
+    ]
+  }
+}
