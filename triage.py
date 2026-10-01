@@ -17,15 +17,26 @@ Usage:
     python triage.py sample.txt
     python triage.py sample.txt --provider anthropic
     cat mail.txt | python triage.py --provider openai
+    python triage.py sample.txt --json --out       # JSON to stdout and out/sample.out.json
+    python triage.py sample.txt --json -o res.json # JSON to stdout and res.json
 """
 
 import argparse
 import os
 import sys
+import time
 from enum import Enum
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 from loguru import logger
+
+from rich import box
+from rich.console import Console, Group
+from rich.padding import Padding
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.config import JsonDict
@@ -113,6 +124,9 @@ Leave out dates you cannot pin down.
 
 For amounts, give the number and its ISO 4217 currency code; use {DEFAULT_CCY} if the
 message does not name a currency."""
+
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+OUT_DIR = Path("out")
 
 OPENAI_MODEL = "gpt-5.6"
 ANTHROPIC_MODEL = "claude-sonnet-5-5"
@@ -228,11 +242,140 @@ def triage_anthropic(text: str) -> TriageResult:
 # 4. OUTPUT
 # ---------------------------------------------------------------------------
 
-def render(result: TriageResult) -> None:
-    """Pretty-print the result to the terminal."""
-    # TODO: use `rich` (Panel/Table) for a nice view; fall back to plain text.
-    # Tip: result.model_dump() gives you a dict if you want json.dumps for --json.
-    print(result.model_dump_json(indent=2))
+# Look of each category: (emoji, colour).
+CATEGORY_STYLE: dict[Category, tuple[str, str]] = {
+    Category.urgent: ("🚨", "bold red"),
+    Category.invoice: ("💸", "bold yellow"),
+    Category.spam: ("🗑️", "bold magenta"),
+    Category.question: ("❓", "bold cyan"),
+    Category.newsletter: ("📰", "bold blue"),
+    Category.ignore: ("💤", "bold bright_black"),
+    Category.other: ("📌", "bold white"),
+}
+
+# Priority 1..5 -> colour and label, from calm green to alarm red.
+PRIORITY_STYLE = {
+    1: ("green", "trivial"),
+    2: ("bright_green", "low"),
+    3: ("yellow", "normal"),
+    4: ("dark_orange", "high"),
+    5: ("bold red", "drop everything"),
+}
+
+
+def _priority_meter(priority: int) -> Text:
+    colour, label = PRIORITY_STYLE[priority]
+    meter = Text()
+    meter.append("█" * priority * 2, style=colour)
+    meter.append("░" * (5 - priority) * 2, style="bright_black")
+    meter.append(f"  {priority}/5 ", style=f"bold {colour}")
+    meter.append(label, style=f"italic {colour}")
+    return meter
+
+
+def _days_away(day: date) -> Text:
+    delta = (day - date.today()).days
+    if delta < 0:
+        return Text(f"{-delta}d ago", style="bright_black")
+    if delta == 0:
+        return Text("today", style="bold red")
+    if delta <= 3:
+        return Text(f"in {delta}d", style="bold dark_orange")
+    return Text(f"in {delta}d", style="green")
+
+
+def _extracted_table(extracted: Extracted) -> Table | None:
+    table = Table(box=box.SIMPLE_HEAD, show_edge=False, expand=True, header_style="bold")
+    table.add_column("", width=2)
+    table.add_column("Kind", style="bold")
+    table.add_column("Value", ratio=1)
+    table.add_column("When", justify="right")
+
+    deadlines = set(extracted.deadlines)
+    for day in sorted(extracted.deadlines):
+        table.add_row("⏰", "Deadline", Text(day.strftime("%a %d %b %Y"), style="bold"), _days_away(day))
+    for day in sorted(set(extracted.dates) - deadlines):
+        table.add_row("📅", "Date", day.strftime("%a %d %b %Y"), _days_away(day))
+    for money in extracted.amounts:
+        table.add_row("💰", "Amount", Text(f"{money.amount:,.2f} {money.currency}", style="bold green"), "")
+    for name in extracted.names:
+        table.add_row("👤", "Name", name, "")
+
+    return table if table.row_count else None
+
+
+def render(result: TriageResult, console: Console | None = None) -> None:
+    """Pretty-print the result to the terminal as a triage card."""
+    console = console or Console()
+    emoji, colour = CATEGORY_STYLE[result.category]
+
+    header = Table.grid(expand=True, padding=(0, 1))
+    header.add_column(ratio=1)
+    header.add_column(justify="right")
+    header.add_row(
+        Text(f"{emoji}  {result.category.value.upper()}", style=colour),
+        _priority_meter(result.priority),
+    )
+
+    parts: list = [header, Padding(Text(result.summary, style="italic"), (1, 0, 0, 0))]
+
+    table = _extracted_table(result.extracted)
+    if table is not None:
+        parts.append(Padding(table, (1, 0, 0, 0)))
+
+    if result.suggested_reply:
+        parts.append(
+            Padding(
+                Panel(
+                    Text(result.suggested_reply),
+                    title="✍️  Suggested reply",
+                    title_align="left",
+                    border_style="bright_black",
+                    box=box.ROUNDED,
+                    padding=(0, 1),
+                ),
+                (1, 0, 0, 0),
+            )
+        )
+    else:
+        parts.append(Padding(Text("No reply needed.", style="bright_black"), (1, 0, 0, 0)))
+
+    console.print(
+        Panel(
+            Group(*parts),
+            title="[bold]📨 Inbox Triage[/bold]",
+            title_align="left",
+            border_style=PRIORITY_STYLE[result.priority][0],
+            box=box.HEAVY,
+            padding=(1, 2),
+        )
+    )
+
+
+def default_out_path(input_path: str | None) -> Path:
+    """out/<input name>.out.json, or a timestamped name when reading stdin."""
+    if input_path is None:
+        stem = f"stdin_{datetime.now():%Y%m%d-%H%M%S}"
+    else:
+        stem = Path(input_path).stem
+    return OUT_DIR / f"{stem}.out.json"
+
+
+def write_output(result: TriageResult, path: Path) -> None:
+    """Save the result as JSON, creating parent folders as needed."""
+    log = logger.opt(colors=True)
+    path = path.resolve()
+    log.info("Writing result to <cyan>{path}</cyan>", path=path)
+
+    if not path.parent.exists():
+        log.debug("Creating folder <cyan>{folder}</cyan>", folder=path.parent)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        log.debug("Overwriting existing file <cyan>{path}</cyan>", path=path)
+
+    data = result.model_dump_json(indent=2) + "\n"
+    path.write_text(data, encoding="utf-8")
+    log.info("Wrote {size:,} bytes to <cyan>{path}</cyan>", size=len(data.encode("utf-8")), path=path)
 
 
 def main() -> int:
@@ -245,17 +388,39 @@ def main() -> int:
         help="Which LLM provider to use",
     )
     parser.add_argument("--json", action="store_true", help="Print raw JSON only")
+    parser.add_argument(
+        "-o",
+        "--out",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="With --json, also save the result to PATH (default: out/<input name>.out.json)",
+    )
     args = parser.parse_args()
+    if args.out is not None and not args.json:
+        parser.error("--out requires --json")
+    # "--out sample.txt" would take the input file as the output path and
+    # overwrite it, so insist on a .json output name.
+    if args.out and Path(args.out).suffix.lower() != ".json":
+        parser.error(f"--out path must end in .json, got {args.out!r} (put the input file before --out)")
 
-    # Log to the console at LOG_LEVEL (default DEBUG, so everything shows).
-    # Set LOG_LEVEL=WARNING for quiet runs. Logs go to stderr, not stdout, so
-    # the --json output stays clean when piped into jq or a file.
+    # Log to logs/triage_YYYY-MM-DD.log at LOG_LEVEL (default DEBUG), starting
+    # a new file at midnight. Warnings and errors are also echoed to stderr so
+    # problems stay visible; with --json only errors are, so pipelines stay quiet.
+    log_format = "{time:YYYY-MM-DD HH:mm:ss.SSS Z} | {level: <8} | {message}"
     logger.remove()
     logger.add(
-        sys.stderr,
+        LOG_DIR / "triage_{time:YYYY-MM-DD}.log",
         level=os.getenv("LOG_LEVEL", "DEBUG").upper(),
         # Z = UTC offset, e.g. 2026-09-27 20:49:32.213 +07:00
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS Z}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+        format=log_format,
+        rotation="00:00",
+        encoding="utf-8",
+    )
+    logger.add(
+        sys.stderr,
+        level="ERROR" if args.json else "WARNING",
+        format="<level>{level: <8}</level> | <level>{message}</level>",
     )
 
     try:
@@ -263,15 +428,48 @@ def main() -> int:
     except FileNotFoundError:
         parser.error(f"File not found: {args.path}")        
 
+    if args.provider == "openai":
+        triage, provider_name, model = triage_openai, "OpenAI", OPENAI_MODEL
+    else:
+        triage, provider_name, model = triage_anthropic, "Anthropic", ANTHROPIC_MODEL
+
+    # Spinner and timing go to stderr, and are silenced entirely with --json
+    # so the output can be part of a pipeline.
+    status_console = Console(stderr=True, quiet=args.json)
+    status_text = (
+        f"[bold]📨 Triaging message[/bold] ({len(text):,} chars) · "
+        f"waiting for [cyan]{model}[/cyan] on {provider_name}…"
+    )
+    started = time.perf_counter()
     try:
-        result = triage_openai(text) if args.provider == "openai" else triage_anthropic(text)
+        with status_console.status(status_text, spinner="dots"):
+            result = triage(text)
     except TriageRefusal as exc:
         logger.error("{}", exc)
         return 1
+    elapsed = time.perf_counter() - started
+    logger.info("Got response from {model} in {elapsed:.1f}s", model=model, elapsed=elapsed)
+    status_console.print(f"[green]✓[/green] Response from [cyan]{model}[/cyan] in {elapsed:.1f}s", highlight=False)
+
+    if args.out is not None:
+        if args.out:
+            out_path = Path(args.out)
+        else:
+            out_path = default_out_path(args.path)
+            logger.opt(colors=True).debug(
+                "No --out path given, using default <cyan>{path}</cyan>", path=out_path
+            )
+        try:
+            write_output(result, out_path)
+        except OSError as exc:
+            logger.error("Cannot write {path}: {error}", path=out_path, error=exc)
+            return 1
 
     if args.json:
+        logger.debug("Printing JSON result to stdout")
         print(result.model_dump_json(indent=2))
     else:
+        logger.debug("Rendering result card")
         render(result)
 
     return 0
