@@ -3,13 +3,14 @@
 Acceptance criteria from the issue:
   - Use the OpenAI Python SDK with the Responses API.
   - The output shape is the Pydantic model `TriageResult`.
-  - Call `client.responses.parse(model=..., input=[system, user], text_format=TriageResult)`.
+  - Call `await client.responses.parse(model=..., input=[system, user], text_format=TriageResult)`.
   - Return `response.output_parsed` (already validated, no `json.loads`).
   - Handle `output_parsed is None` (a safety refusal) gracefully.
 
-The OpenAI client is replaced with a fake, so no network or API key is needed.
-The fake is patched in as both `openai.OpenAI` and `triage.OpenAI`, so either
-`from openai import OpenAI` (module or function level) or `openai.OpenAI()` works.
+The async OpenAI client is replaced with a fake, so no network or API key is needed.
+The fake is patched in as both `openai.AsyncOpenAI` and `triage.AsyncOpenAI`, so either
+`from openai import AsyncOpenAI` (module or function level) or `openai.AsyncOpenAI()` works.
+triage_openai() is a coroutine, so the tests drive it with asyncio.run().
 
 Live test (optional, costs a few tokens):
     OPENAI_LIVE_TEST=1 OPENAI_API_KEY=sk-... pytest -v -k live
@@ -17,6 +18,7 @@ Live test (optional, costs a few tokens):
 Run with:  pytest -v
 """
 
+import asyncio
 import inspect
 import io
 import json
@@ -94,18 +96,24 @@ def refusal_response():
 
 def empty_response():
     """output_parsed is None and there is no refusal block (e.g. incomplete output)."""
-    return SimpleNamespace(output_parsed=None, output_text="", output=[])
+    return SimpleNamespace(
+        output_parsed=None,
+        output_text="",
+        output=[],
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+    )
 
 
 class _Responses:
     def __init__(self, owner):
         self._owner = owner
 
-    def parse(self, **kwargs):
+    async def parse(self, **kwargs):
         self._owner.parse_calls.append(kwargs)
         return self._owner.response
 
-    def create(self, **kwargs):
+    async def create(self, **kwargs):
         raise AssertionError("Use responses.parse(text_format=...), not responses.create()")
 
 
@@ -116,7 +124,7 @@ class _Chat:
 
 
 class FakeOpenAI:
-    """Stand-in for openai.OpenAI that records calls to responses.parse."""
+    """Stand-in for openai.AsyncOpenAI that records calls to responses.parse."""
 
     instances: list["FakeOpenAI"] = []
     response = None
@@ -144,8 +152,8 @@ def fake_openai(monkeypatch):
         response = parsed_response(make_result())
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-a-real-key")
-    monkeypatch.setattr(openai, "OpenAI", Fake)
-    monkeypatch.setattr(triage, "OpenAI", Fake, raising=False)
+    monkeypatch.setattr(openai, "AsyncOpenAI", Fake)
+    monkeypatch.setattr(triage, "AsyncOpenAI", Fake, raising=False)
     return Fake
 
 
@@ -272,19 +280,19 @@ def test_money_default_is_kept_out_of_strict_schema():
 # ---------------------------------------------------------------------------
 
 def test_calls_responses_parse_once(fake_openai):
-    triage.triage_openai("hello")
+    asyncio.run(triage.triage_openai("hello"))
 
     single_parse_call(fake_openai)
 
 
 def test_passes_triage_result_as_text_format(fake_openai):
-    triage.triage_openai("hello")
+    asyncio.run(triage.triage_openai("hello"))
 
     assert single_parse_call(fake_openai)["text_format"] is triage.TriageResult
 
 
 def test_passes_a_model_name(fake_openai):
-    triage.triage_openai("hello")
+    asyncio.run(triage.triage_openai("hello"))
 
     model = single_parse_call(fake_openai).get("model")
     assert isinstance(model, str) and model.strip()
@@ -293,7 +301,7 @@ def test_passes_a_model_name(fake_openai):
 def test_input_is_system_then_user(fake_openai):
     message = "Subject: Invoice #4471\n\nPlease pay by Friday."
 
-    triage.triage_openai(message)
+    asyncio.run(triage.triage_openai(message))
 
     messages = single_parse_call(fake_openai)["input"]
     assert isinstance(messages, list) and len(messages) == 2
@@ -307,7 +315,7 @@ def test_input_is_system_then_user(fake_openai):
 def test_user_text_is_passed_verbatim(fake_openai):
     message = "Zażółć gęślą jaźń — 請求書 — {\"not\": \"a template\"} — <b>"
 
-    triage.triage_openai(message)
+    asyncio.run(triage.triage_openai(message))
 
     user = single_parse_call(fake_openai)["input"][-1]
     assert user["content"] == message
@@ -336,7 +344,7 @@ def test_system_prompt_names_default_currency():
 # ---------------------------------------------------------------------------
 
 def test_returns_triage_result(fake_openai):
-    result = triage.triage_openai("hello")
+    result = asyncio.run(triage.triage_openai("hello"))
 
     assert isinstance(result, triage.TriageResult)
 
@@ -345,14 +353,14 @@ def test_returns_output_parsed_unchanged(fake_openai):
     expected = make_result(category=triage.Category.urgent, priority=5, summary="Server down.")
     fake_openai.response = parsed_response(expected)
 
-    result = triage.triage_openai("prod is down!")
+    result = asyncio.run(triage.triage_openai("prod is down!"))
 
     assert result == expected
 
 
 def test_does_not_reparse_output_text(fake_openai):
     """output_text is garbage in the fake; success proves it was not json.loads()'d."""
-    result = triage.triage_openai("hello")
+    result = asyncio.run(triage.triage_openai("hello"))
 
     assert result.summary == make_result().summary
 
@@ -380,7 +388,7 @@ def test_none_output_parsed_does_not_return_none(fake_openai, response_factory):
     fake_openai.response = response_factory()
 
     try:
-        result = triage.triage_openai("something the model refuses")
+        result = asyncio.run(triage.triage_openai("something the model refuses"))
     except ACCIDENTAL_ERRORS as exc:
         pytest.fail(f"Refusal crashed with an incidental {type(exc).__name__}: {exc}")
     except Exception:
@@ -393,7 +401,7 @@ def test_refusal_error_is_explicit(fake_openai):
     fake_openai.response = refusal_response()
 
     with pytest.raises(Exception) as excinfo:
-        triage.triage_openai("something the model refuses")
+        asyncio.run(triage.triage_openai("something the model refuses"))
 
     assert not isinstance(excinfo.value, ACCIDENTAL_ERRORS), (
         f"Refusal should raise a deliberate error, got {type(excinfo.value).__name__}"
@@ -402,6 +410,21 @@ def test_refusal_error_is_explicit(fake_openai):
     assert "refus" in msg.lower() or REFUSAL_TEXT in msg, (
         f"Error should say the model refused; got: {msg!r}"
     )
+
+
+def test_incomplete_output_names_the_reason(fake_openai):
+    fake_openai.response = empty_response()
+
+    with pytest.raises(triage.TriageRefusal, match="incomplete.*max_output_tokens"):
+        asyncio.run(triage.triage_openai("a very long message"))
+
+
+def test_client_has_a_finite_timeout(fake_openai):
+    """The SDK default (10 minutes per attempt) is far too long for a CLI."""
+    asyncio.run(triage.triage_openai("hello"))
+
+    timeout = fake_openai.instances[0].init_kwargs.get("timeout")
+    assert isinstance(timeout, (int, float)) and 0 < timeout <= 120
 
 
 def test_cli_refusal_exits_cleanly(fake_openai, monkeypatch, capsys):
@@ -469,7 +492,7 @@ def test_main_sends_file_contents_to_openai(fake_openai, monkeypatch, capsys):
 def test_live_openai_on_sample():
     text = (ROOT / "sample.txt").read_text(encoding="utf-8")
 
-    result = triage.triage_openai(text)
+    result = asyncio.run(triage.triage_openai(text))
 
     assert isinstance(result, triage.TriageResult)
     assert result.category == triage.Category.invoice

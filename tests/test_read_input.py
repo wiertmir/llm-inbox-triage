@@ -186,7 +186,7 @@ def test_main_passes_stdin_text_to_provider(monkeypatch, capsys, provider):
     """`cat mail.txt | python triage.py` -> the piped text reaches the provider."""
     seen = {}
 
-    def fake_triage(text):
+    async def fake_triage(text):
         seen["text"] = text
         return _fake_result()
 
@@ -198,10 +198,70 @@ def test_main_passes_stdin_text_to_provider(monkeypatch, capsys, provider):
     assert seen["text"].strip() == "hello from a pipe"
 
 
+def _no_provider_call(text):
+    raise AssertionError("the provider must not be called")
+
+
+@pytest.mark.parametrize("stdin", ["", "   \n\t\n"])
+def test_cli_empty_input_is_not_sent(monkeypatch, capsys, stdin):
+    """An empty message would only waste an API call; stop with an error instead."""
+    monkeypatch.setattr(triage, "triage_openai", _no_provider_call)
+    monkeypatch.setattr(sys, "argv", ["triage.py", "--json"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+
+    code = triage.main()
+
+    out, err = capsys.readouterr()
+    assert code not in (0, None)
+    assert out == ""
+    assert "empty" in err.lower()
+
+
+def _run_cli(monkeypatch, argv):
+    monkeypatch.setattr(triage, "triage_openai", _no_provider_call)
+    monkeypatch.setattr(sys, "argv", ["triage.py", *argv, "--json"])
+    try:
+        return triage.main()
+    except SystemExit as exc:
+        return exc.code
+
+
+def test_cli_directory_as_input_exits_cleanly(monkeypatch, capsys, tmp_path):
+    code = _run_cli(monkeypatch, [str(tmp_path)])
+
+    err = capsys.readouterr().err
+    assert code not in (0, None)
+    assert "Cannot read" in err and "Traceback" not in err
+
+
+def test_cli_non_utf8_input_exits_cleanly(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "latin1.txt"
+    path.write_bytes("Zażółć gęślą jaźń".encode("cp1250"))
+
+    code = _run_cli(monkeypatch, [str(path)])
+
+    err = capsys.readouterr().err
+    assert code not in (0, None)
+    assert "UTF-8" in err and "Traceback" not in err
+
+
+def test_cli_ctrl_c_exits_cleanly(monkeypatch, capsys):
+    async def interrupted(text):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(triage, "triage_openai", interrupted)
+    # Without --json, so the warning reaches stderr (with --json only errors do).
+    monkeypatch.setattr(sys, "argv", ["triage.py"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("hello"))
+
+    assert triage.main() == 130
+    assert "Interrupted" in capsys.readouterr().err
+
+
 def test_main_passes_file_text_to_provider(monkeypatch, capsys):
     seen = {}
 
-    def fake_triage(text):
+    async def fake_triage(text):
         seen["text"] = text
         return _fake_result()
 

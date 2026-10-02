@@ -46,6 +46,8 @@ cd llm-inbox-triage
 pip install -r requirements.txt
 
 # 3. Set your API key(s) — never hardcode them; .env is gitignored
+cp .env.example .env    # then fill in the keys (loaded automatically)
+# ...or export them; variables already set in the environment win over .env
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 

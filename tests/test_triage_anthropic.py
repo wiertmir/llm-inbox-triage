@@ -12,6 +12,8 @@ whichever way it is called:
   - messages.create() without tools      -> a text block containing the JSON
   - messages.parse(output_format=...)    -> a message with parsed_output
 Tool-specific tests are skipped when the forced-tool approach is not used.
+The fake stands in for the async client (AsyncAnthropic), and triage_anthropic()
+is a coroutine, so the tests drive it with asyncio.run().
 
 Live test (optional, costs a few tokens):
     ANTHROPIC_LIVE_TEST=1 ANTHROPIC_API_KEY=sk-ant-... pytest -v -k live
@@ -19,6 +21,7 @@ Live test (optional, costs a few tokens):
 Run with:  pytest -v
 """
 
+import asyncio
 import copy
 import io
 import json
@@ -86,17 +89,17 @@ class _Messages:
     def __init__(self, owner):
         self._owner = owner
 
-    def create(self, **kwargs):
+    async def create(self, **kwargs):
         self._owner.calls.append(("create", kwargs))
         return self._owner.reply("create", kwargs)
 
-    def parse(self, **kwargs):
+    async def parse(self, **kwargs):
         self._owner.calls.append(("parse", kwargs))
         return self._owner.reply("parse", kwargs)
 
 
 class FakeAnthropic:
-    """Stand-in for anthropic.Anthropic that records calls to messages.*."""
+    """Stand-in for anthropic.AsyncAnthropic that records calls to messages.*."""
 
     instances: list["FakeAnthropic"] = []
     scenario = "ok"  # "ok" | "refusal" | "empty"
@@ -155,8 +158,8 @@ def fake_anthropic(monkeypatch):
         preamble = False
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-a-real-key")
-    monkeypatch.setattr(anthropic, "Anthropic", Fake)
-    monkeypatch.setattr(triage, "Anthropic", Fake, raising=False)
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", Fake)
+    monkeypatch.setattr(triage, "AsyncAnthropic", Fake, raising=False)
     return Fake
 
 
@@ -188,13 +191,13 @@ ACCIDENTAL_ERRORS = (AttributeError, TypeError, KeyError, IndexError, NotImpleme
 # ---------------------------------------------------------------------------
 
 def test_calls_anthropic_once(fake_anthropic):
-    triage.triage_anthropic("hello")
+    asyncio.run(triage.triage_anthropic("hello"))
 
     single_call(fake_anthropic)
 
 
 def test_system_prompt_is_passed_as_system_param(fake_anthropic):
-    triage.triage_anthropic("hello")
+    asyncio.run(triage.triage_anthropic("hello"))
 
     _, kwargs = single_call(fake_anthropic)
     assert "system" in kwargs, "Anthropic takes the system prompt as `system=`, not as a message"
@@ -204,7 +207,7 @@ def test_system_prompt_is_passed_as_system_param(fake_anthropic):
 def test_messages_is_a_single_user_turn(fake_anthropic):
     message_text = "Subject: Invoice #4471\n\nPlease pay by Friday."
 
-    triage.triage_anthropic(message_text)
+    asyncio.run(triage.triage_anthropic(message_text))
 
     _, kwargs = single_call(fake_anthropic)
     messages = list(kwargs["messages"])
@@ -216,14 +219,14 @@ def test_messages_is_a_single_user_turn(fake_anthropic):
 def test_user_text_is_passed_verbatim(fake_anthropic):
     message_text = "Zażółć gęślą jaźń — 請求書 — {\"not\": \"a template\"} — <b>"
 
-    triage.triage_anthropic(message_text)
+    asyncio.run(triage.triage_anthropic(message_text))
 
     _, kwargs = single_call(fake_anthropic)
     assert as_text(list(kwargs["messages"])[-1]["content"]) == message_text
 
 
 def test_passes_a_claude_model(fake_anthropic):
-    triage.triage_anthropic("hello")
+    asyncio.run(triage.triage_anthropic("hello"))
 
     _, kwargs = single_call(fake_anthropic)
     model = kwargs.get("model")
@@ -232,7 +235,7 @@ def test_passes_a_claude_model(fake_anthropic):
 
 def test_passes_max_tokens(fake_anthropic):
     """max_tokens is required by the Messages API."""
-    triage.triage_anthropic("hello")
+    asyncio.run(triage.triage_anthropic("hello"))
 
     _, kwargs = single_call(fake_anthropic)
     max_tokens = kwargs.get("max_tokens")
@@ -244,7 +247,7 @@ def test_passes_max_tokens(fake_anthropic):
 # ---------------------------------------------------------------------------
 
 def test_single_tool_built_from_triage_result_schema(fake_anthropic):
-    triage.triage_anthropic("hello")
+    asyncio.run(triage.triage_anthropic("hello"))
 
     tools = list(forced_tool_kwargs(fake_anthropic)["tools"])
     assert len(tools) == 1
@@ -254,7 +257,7 @@ def test_single_tool_built_from_triage_result_schema(fake_anthropic):
 
 
 def test_tool_choice_forces_the_tool(fake_anthropic):
-    triage.triage_anthropic("hello")
+    asyncio.run(triage.triage_anthropic("hello"))
 
     kwargs = forced_tool_kwargs(fake_anthropic)
     tool_choice = kwargs.get("tool_choice")
@@ -267,7 +270,7 @@ def test_tool_choice_forces_the_tool(fake_anthropic):
 def test_text_before_tool_use_is_ignored(fake_anthropic):
     fake_anthropic.preamble = True
 
-    result = triage.triage_anthropic("hello")
+    result = asyncio.run(triage.triage_anthropic("hello"))
 
     forced_tool_kwargs(fake_anthropic)
     assert result == make_result()
@@ -278,7 +281,7 @@ def test_text_before_tool_use_is_ignored(fake_anthropic):
 # ---------------------------------------------------------------------------
 
 def test_returns_triage_result(fake_anthropic):
-    result = triage.triage_anthropic("hello")
+    result = asyncio.run(triage.triage_anthropic("hello"))
 
     assert isinstance(result, triage.TriageResult)
     assert isinstance(result.category, triage.Category)
@@ -289,7 +292,7 @@ def test_returns_what_claude_sent(fake_anthropic):
     expected = make_result(category=triage.Category.urgent, priority=5, summary="Server down.")
     fake_anthropic.payload = expected.model_dump(mode="json")
 
-    result = triage.triage_anthropic("prod is down!")
+    result = asyncio.run(triage.triage_anthropic("prod is down!"))
 
     assert result == expected
 
@@ -297,11 +300,11 @@ def test_returns_what_claude_sent(fake_anthropic):
 def test_null_suggested_reply_is_kept(fake_anthropic):
     fake_anthropic.payload = make_payload(suggested_reply=None)
 
-    assert triage.triage_anthropic("newsletter").suggested_reply is None
+    assert asyncio.run(triage.triage_anthropic("newsletter")).suggested_reply is None
 
 
 def test_extracted_json_values_become_date_and_money(fake_anthropic):
-    result = triage.triage_anthropic("hello")
+    result = asyncio.run(triage.triage_anthropic("hello"))
 
     assert fake_anthropic.payload["extracted"]["dates"] == ["2026-08-31"]
     assert result.extracted.dates == [date(2026, 8, 31)]
@@ -314,7 +317,7 @@ def test_amount_without_currency_gets_default_ccy(fake_anthropic):
         extracted={**make_payload()["extracted"], "amounts": [{"amount": 5000}]}
     )
 
-    result = triage.triage_anthropic("hello")
+    result = asyncio.run(triage.triage_anthropic("hello"))
 
     assert result.extracted.amounts == [triage.Money(amount=5000.0, currency=triage.DEFAULT_CCY)]
 
@@ -345,7 +348,7 @@ def test_invalid_output_is_rejected(fake_anthropic, bad_payload):
     fake_anthropic.payload = bad_payload()
 
     with pytest.raises(Exception) as excinfo:
-        triage.triage_anthropic("hello")
+        asyncio.run(triage.triage_anthropic("hello"))
 
     assert not isinstance(excinfo.value, ACCIDENTAL_ERRORS), (
         f"Invalid output should fail validation, got {type(excinfo.value).__name__}"
@@ -358,18 +361,19 @@ def test_equivalent_to_openai_for_the_same_output(fake_anthropic, monkeypatch):
     class FakeOpenAI:
         def __init__(self, *args, **kwargs):
             self.base_url = "https://api.openai.com/v1/"
-            self.responses = SimpleNamespace(
-                parse=lambda **_: SimpleNamespace(
-                    output_parsed=triage.TriageResult.model_validate(payload), output=[]
-                )
+            self.responses = SimpleNamespace(parse=self._parse)
+
+        async def _parse(self, **_):
+            return SimpleNamespace(
+                output_parsed=triage.TriageResult.model_validate(payload), output=[]
             )
 
     openai = pytest.importorskip("openai")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-a-real-key")
-    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
-    monkeypatch.setattr(triage, "OpenAI", FakeOpenAI, raising=False)
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeOpenAI)
+    monkeypatch.setattr(triage, "AsyncOpenAI", FakeOpenAI, raising=False)
 
-    assert triage.triage_anthropic("hello") == triage.triage_openai("hello")
+    assert asyncio.run(triage.triage_anthropic("hello")) == asyncio.run(triage.triage_openai("hello"))
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +384,24 @@ def test_refusal_raises_triage_refusal(fake_anthropic):
     fake_anthropic.scenario = "refusal"
 
     with pytest.raises(triage.TriageRefusal) as excinfo:
-        triage.triage_anthropic("something the model refuses")
+        asyncio.run(triage.triage_anthropic("something the model refuses"))
 
     assert "refus" in str(excinfo.value).lower()
+
+
+def test_max_tokens_cut_off_is_named(fake_anthropic):
+    fake_anthropic.scenario = "empty"  # stop_reason="max_tokens"
+
+    with pytest.raises(triage.TriageRefusal, match="max_tokens"):
+        asyncio.run(triage.triage_anthropic("a very long message"))
+
+
+def test_client_has_a_finite_timeout(fake_anthropic):
+    """The SDK default (10 minutes per attempt) is far too long for a CLI."""
+    asyncio.run(triage.triage_anthropic("hello"))
+
+    timeout = fake_anthropic.instances[0].init_kwargs.get("timeout")
+    assert isinstance(timeout, (int, float)) and 0 < timeout <= 120
 
 
 def test_empty_reply_is_an_explicit_error(fake_anthropic):
@@ -390,7 +409,7 @@ def test_empty_reply_is_an_explicit_error(fake_anthropic):
     fake_anthropic.scenario = "empty"
 
     try:
-        result = triage.triage_anthropic("hello")
+        result = asyncio.run(triage.triage_anthropic("hello"))
     except ACCIDENTAL_ERRORS as exc:
         pytest.fail(f"Empty reply crashed with an incidental {type(exc).__name__}: {exc}")
     except Exception:
@@ -435,8 +454,8 @@ def test_cli_does_not_call_openai(fake_anthropic, monkeypatch, capsys):
             raise AssertionError("--provider anthropic must not create an OpenAI client")
 
     openai = pytest.importorskip("openai")
-    monkeypatch.setattr(openai, "OpenAI", NoOpenAI)
-    monkeypatch.setattr(triage, "OpenAI", NoOpenAI, raising=False)
+    monkeypatch.setattr(openai, "AsyncOpenAI", NoOpenAI)
+    monkeypatch.setattr(triage, "AsyncOpenAI", NoOpenAI, raising=False)
 
     code, _ = run_main(monkeypatch, capsys, ["--provider", "anthropic", "--json"], stdin="hello")
 
@@ -470,7 +489,7 @@ def test_cli_refusal_exits_cleanly(fake_anthropic, monkeypatch, capsys):
 def test_live_anthropic_on_sample():
     text = (ROOT / "sample.txt").read_text(encoding="utf-8")
 
-    result = triage.triage_anthropic(text)
+    result = asyncio.run(triage.triage_anthropic(text))
 
     assert isinstance(result, triage.TriageResult)
     assert result.category == triage.Category.invoice

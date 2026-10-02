@@ -9,8 +9,13 @@ category, priority, summary, suggested reply, and extracted data.
 We do NOT ask the model for "STRICT JSON and nothing else" and then json.loads()
 the raw text (that's the old, fragile pattern). Instead we use STRUCTURED OUTPUTS:
 define the shape as a Pydantic model and let the API GUARANTEE the schema.
-  - OpenAI:    client.responses.parse(..., text_format=TriageResult) -> .output_parsed
-  - Anthropic: tool/JSON schema with strict validation, then validate with Pydantic
+  - OpenAI:    await client.responses.parse(..., text_format=TriageResult) -> .output_parsed
+  - Anthropic: await client.messages.parse(..., output_format=TriageResult) -> .parsed_output
+Both providers use the async SDK clients (AsyncOpenAI / AsyncAnthropic).
+Transient API errors (rate limit, timeout, overload, 5xx) are retried with
+exponential backoff via tenacity (honouring the server's Retry-After hint);
+everything else fails fast with a short message. API keys are read from the
+environment or from a .env file.
 See ../../../openai-old-vs-new.md for the old->new cheat sheet.
 
 Usage:
@@ -22,6 +27,8 @@ Usage:
 """
 
 import argparse
+import asyncio
+import json
 import os
 import sys
 import time
@@ -40,17 +47,26 @@ from rich.text import Text
 
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.config import JsonDict
-from typing import Iterable
+from typing import Awaitable, Callable, Iterable, TypeVar
 
-from openai import OpenAI
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random,
+)
+
+import openai
+from openai import AsyncOpenAI
 from openai.types.responses import ParsedResponse, ResponseInputParam
 
-from anthropic import Anthropic
+import anthropic
+from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
 
-# TODO: load .env (python-dotenv) so API keys are picked up automatically
-# from dotenv import load_dotenv
-# load_dotenv()
+from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +127,10 @@ class TriageRefusal(Exception):
     """The model declined or produced no structured output."""
 
 
+class MissingApiKey(Exception):
+    """The provider's API key environment variable is not set."""
+
+
 # Note how short the system prompt is now: we no longer beg for JSON formatting.
 # The schema does that job. We only describe the *task* and the *judgement*.
 SYSTEM_PROMPT = f"""You are an inbox triage assistant. Analyse the message and fill in
@@ -130,6 +150,25 @@ OUT_DIR = Path("out")
 
 OPENAI_MODEL = "gpt-5.6"
 ANTHROPIC_MODEL = "claude-sonnet-5-5"
+
+OPENAI_KEY_ENV = "OPENAI_API_KEY"
+ANTHROPIC_KEY_ENV = "ANTHROPIC_API_KEY"
+
+# Room for the summary, reply and extracted lists; longer output gets cut off.
+ANTHROPIC_MAX_TOKENS = 2048
+
+# Per-request timeout. The SDK default is 10 minutes, which across all retry
+# attempts could keep the spinner going for nearly an hour on a stuck request.
+REQUEST_TIMEOUT_SECONDS = 60.0
+
+# Retry policy for transient API errors: up to 5 attempts, waiting about
+# 1s, 2s, 4s, 8s in between (plus up to 1s of jitter), i.e. ~15-19s in total.
+MAX_ATTEMPTS = 5
+BACKOFF_MAX_SECONDS = 20
+# Same status codes the SDKs themselves retry; any 5xx (incl. 529 overloaded) too.
+RETRYABLE_STATUS = {408, 409, 429}
+# Longest wait we accept from a server's Retry-After header.
+RETRY_AFTER_MAX_SECONDS = 60
 
 
 # ---------------------------------------------------------------------------
@@ -152,14 +191,103 @@ def read_input(path: str | None) -> str:
         with open(path, encoding="utf-8") as fd:
             text = fd.read()
     
-    if not text.strip():
-        logger.opt(colors=True).warning("Input from <cyan>{source}</cyan> is empty", source=source)
+    logger.opt(colors=True).debug(
+        "Read {size:,} chars from <cyan>{source}</cyan>", size=len(text), source=source
+    )
     return text
 
 
 # ---------------------------------------------------------------------------
 # 3. PROVIDERS  (both return a validated TriageResult, not a raw dict)
 # ---------------------------------------------------------------------------
+
+def _is_transient(exc: BaseException) -> bool:
+    """Rate limits, timeouts, dropped connections and server-side errors."""
+    if isinstance(exc, (openai.APIConnectionError, anthropic.APIConnectionError)):
+        return True  # includes APITimeoutError
+    if isinstance(exc, (openai.APIStatusError, anthropic.APIStatusError)):
+        return exc.status_code in RETRYABLE_STATUS or exc.status_code >= 500
+    return False
+
+
+def _describe_error(exc: BaseException) -> str:
+    """Short one-line description of an API error, e.g. 'RateLimitError (429): ...'."""
+    if isinstance(exc, (openai.APIStatusError, anthropic.APIStatusError)):
+        return f"{type(exc).__name__} ({exc.status_code}): {exc.message}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """The server's own wait hint (retry-after-ms / Retry-After headers), if any."""
+    if not isinstance(exc, (openai.APIStatusError, anthropic.APIStatusError)):
+        return None
+    headers = exc.response.headers
+    try:
+        if "retry-after-ms" in headers:
+            return float(headers["retry-after-ms"]) / 1000
+        if "retry-after" in headers:
+            return float(headers["retry-after"])
+    except ValueError:
+        pass  # e.g. the HTTP-date form; our own backoff is good enough then
+    return None
+
+
+_backoff = wait_exponential(multiplier=1, max=BACKOFF_MAX_SECONDS) + wait_random(0, 1)
+
+
+def _wait(state: RetryCallState) -> float:
+    """Exponential backoff, but at least as long as the server asked (capped)."""
+    delay = _backoff(state)
+    exc = state.outcome.exception() if state.outcome else None
+    hint = _retry_after_seconds(exc) if exc else None
+    if hint is not None:
+        delay = max(delay, min(hint, RETRY_AFTER_MAX_SECONDS))
+    return delay
+
+
+def _retrying(provider: str) -> AsyncRetrying:
+    """Retry transient errors with exponential backoff, logging each wait."""
+
+    def log_retry(state: RetryCallState) -> None:
+        exc = state.outcome.exception() if state.outcome else None
+        wait = state.next_action.sleep if state.next_action else 0.0
+        logger.warning(
+            "{provider} request failed (attempt {attempt}/{max}): {error} - retrying in {wait:.1f}s",
+            provider=provider,
+            attempt=state.attempt_number,
+            max=MAX_ATTEMPTS,
+            error=_describe_error(exc) if exc else "unknown error",
+            wait=wait,
+        )
+
+    return AsyncRetrying(
+        retry=retry_if_exception(_is_transient),
+        stop=stop_after_attempt(MAX_ATTEMPTS),
+        wait=_wait,
+        before_sleep=log_retry,
+        reraise=True,
+    )
+
+
+T = TypeVar("T")
+
+
+async def _with_retry(provider: str, call: Callable[[], Awaitable[T]]) -> T:
+    """Await call(), retrying transient errors; the last error is re-raised."""
+    async for attempt in _retrying(provider):
+        with attempt:
+            return await call()
+    # Unreachable: with reraise=True tenacity either returns above or raises.
+    raise AssertionError("retry loop ended without a result")
+
+
+def _require_key(*env_names: str) -> None:
+    """Fail fast, before any request, if none of the key variables is set."""
+    if not any(os.getenv(name) for name in env_names):
+        raise MissingApiKey(
+            f"{env_names[0]} is not set - export it in your environment or add it to .env"
+        )
+
 
 def _refusal_text(response: ParsedResponse[TriageResult]) -> str | None:
     for output in response.output:
@@ -172,10 +300,12 @@ def _refusal_text(response: ParsedResponse[TriageResult]) -> str | None:
 
     return None
 
-def triage_openai(text: str) -> TriageResult:
+async def triage_openai(text: str) -> TriageResult:
     """Call OpenAI with Structured Outputs and return a validated TriageResult."""
     logger.info("Using OpenAI provider")
-    client = OpenAI()
+    _require_key(OPENAI_KEY_ENV)
+    # Retries are ours (see _retrying), so switch off the SDK's built-in ones.
+    client = AsyncOpenAI(max_retries=0, timeout=REQUEST_TIMEOUT_SECONDS)
     logger.debug("OpenAI base URL: {url}", url=client.base_url)
 
     messages: ResponseInputParam = [
@@ -184,31 +314,35 @@ def triage_openai(text: str) -> TriageResult:
     ]
 
     logger.info("Using AI model: {model}", model=OPENAI_MODEL)
-    try:
-        response = client.responses.parse(
+    response = await _with_retry(
+        "OpenAI",
+        lambda: client.responses.parse(
             model=OPENAI_MODEL,
             input=messages,
             text_format=TriageResult
-        )
-    except ValidationError as exc:
-        logger.error("OpenAI output does not match TriageResult: {error}", error=exc)
-        raise
+        ),
+    )
 
     parsed = response.output_parsed
     if parsed is None:
         reason = _refusal_text(response)
         if reason:
             raise TriageRefusal(f"Model refused: {reason}")
+        if response.status == "incomplete":
+            why = response.incomplete_details.reason if response.incomplete_details else None
+            raise TriageRefusal(f"Model output is incomplete ({why or 'unknown reason'})")
         raise TriageRefusal("Model refused or returned no structured output")
     
     return parsed
 
 
-def triage_anthropic(text: str) -> TriageResult:
+async def triage_anthropic(text: str) -> TriageResult:
     """Call Anthropic and return a validated TriageResult.
     """
     logger.info("Using Anthropic provider")
-    client = Anthropic()
+    _require_key(ANTHROPIC_KEY_ENV, "ANTHROPIC_AUTH_TOKEN")
+    # Retries are ours (see _retrying), so switch off the SDK's built-in ones.
+    client = AsyncAnthropic(max_retries=0, timeout=REQUEST_TIMEOUT_SECONDS)
     logger.debug("Anthropic base URL: {url}", url=client.base_url)
 
     messages: Iterable[MessageParam] = [
@@ -217,17 +351,23 @@ def triage_anthropic(text: str) -> TriageResult:
 
     logger.info("Using AI model: {model}", model=ANTHROPIC_MODEL)
 
-    response = client.messages.parse(
-        model=ANTHROPIC_MODEL,
-        system=SYSTEM_PROMPT,
-        max_tokens=1024,
-        messages=messages,
-        output_format=TriageResult
+    response = await _with_retry(
+        "Anthropic",
+        lambda: client.messages.parse(
+            model=ANTHROPIC_MODEL,
+            system=SYSTEM_PROMPT,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            messages=messages,
+            output_format=TriageResult
+        ),
     )
 
     if response.stop_reason == "refusal":
         reason = "".join(block.text for block in response.content if block.type == "text")
         raise TriageRefusal(f"Model refused: {reason}" if reason else "Model refused the request")
+
+    if response.stop_reason == "max_tokens":
+        raise TriageRefusal(f"Model output was cut off at max_tokens={ANTHROPIC_MAX_TOKENS}")
 
     parsed = response.parsed_output
     if parsed is None:
@@ -397,6 +537,8 @@ def main() -> int:
         help="With --json, also save the result to PATH (default: out/<input name>.out.json)",
     )
     args = parser.parse_args()
+    # Pick up API keys from .env; variables already set in the environment win.
+    load_dotenv()
     if args.out is not None and not args.json:
         parser.error("--out requires --json")
     # "--out sample.txt" would take the input file as the output path and
@@ -423,15 +565,32 @@ def main() -> int:
         format="<level>{level: <8}</level> | <level>{message}</level>",
     )
 
+    source = args.path or "stdin"
     try:
         text = read_input(args.path)
     except FileNotFoundError:
-        parser.error(f"File not found: {args.path}")        
+        parser.error(f"File not found: {args.path}")
+    except UnicodeDecodeError:
+        parser.error(f"Cannot read {source}: not UTF-8 text")
+    except OSError as exc:  # a directory, no permission, ...
+        # Windows reports a directory as "Permission denied", so name it ourselves.
+        reason = "is a directory" if Path(source).is_dir() else exc.strerror or exc
+        parser.error(f"Cannot read {source}: {reason}")
+    except KeyboardInterrupt:
+        logger.warning("Interrupted")
+        return 130
 
+    if not text.strip():
+        logger.error("Nothing to triage: {source} is empty", source=source)
+        return 1
+
+    triage: Callable[[str], Awaitable[TriageResult]]
     if args.provider == "openai":
         triage, provider_name, model = triage_openai, "OpenAI", OPENAI_MODEL
+        key_env = OPENAI_KEY_ENV
     else:
         triage, provider_name, model = triage_anthropic, "Anthropic", ANTHROPIC_MODEL
+        key_env = ANTHROPIC_KEY_ENV
 
     # Spinner and timing go to stderr, and are silenced entirely with --json
     # so the output can be part of a pipeline.
@@ -443,9 +602,29 @@ def main() -> int:
     started = time.perf_counter()
     try:
         with status_console.status(status_text, spinner="dots"):
-            result = triage(text)
-    except TriageRefusal as exc:
+            result = asyncio.run(triage(text))
+    except KeyboardInterrupt:
+        logger.warning("Interrupted")
+        return 130
+    except (TriageRefusal, MissingApiKey) as exc:
         logger.error("{}", exc)
+        return 1
+    except (openai.AuthenticationError, anthropic.AuthenticationError) as exc:
+        logger.error("{provider} rejected the API key - check {env}: {error}",
+                     provider=provider_name, env=key_env, error=_describe_error(exc))
+        return 1
+    except (openai.APIError, anthropic.APIError) as exc:
+        if _is_transient(exc):
+            logger.error("{provider} still failing after {n} attempts, giving up: {error}",
+                         provider=provider_name, n=MAX_ATTEMPTS, error=_describe_error(exc))
+        else:
+            logger.error("{provider} request failed: {error}",
+                         provider=provider_name, error=_describe_error(exc))
+        return 1
+    except (ValidationError, json.JSONDecodeError) as exc:
+        logger.error("{provider} returned malformed output that does not match TriageResult",
+                     provider=provider_name)
+        logger.debug("Malformed output details: {error}", error=exc)
         return 1
     elapsed = time.perf_counter() - started
     logger.info("Got response from {model} in {elapsed:.1f}s", model=model, elapsed=elapsed)

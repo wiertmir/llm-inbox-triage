@@ -47,9 +47,10 @@ def make_result(**overrides) -> triage.TriageResult:
 
 def render_to_text(result: triage.TriageResult) -> str:
     # Wide enough that the summary and reply are not wrapped mid-sentence.
-    console = Console(file=io.StringIO(), width=200, color_system=None)
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=200, color_system=None)
     triage.render(result, console=console)
-    return console.file.getvalue()
+    return buffer.getvalue()
 
 
 def test_render_shows_category_priority_summary_and_reply():
@@ -152,7 +153,11 @@ def test_default_out_path_for_stdin_is_timestamped():
 @pytest.fixture
 def fake_openai(monkeypatch):
     result = make_result()
-    monkeypatch.setattr(triage, "triage_openai", lambda text: result)
+
+    async def fake_triage(text):
+        return result
+
+    monkeypatch.setattr(triage, "triage_openai", fake_triage)
     return result
 
 
