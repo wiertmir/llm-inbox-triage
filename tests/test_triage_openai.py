@@ -173,7 +173,7 @@ def test_triage_result_is_pydantic_model():
 
 def test_schema_has_expected_fields():
     fields = set(triage.TriageResult.model_fields)
-    assert fields == {"category", "priority", "summary", "suggested_reply", "extracted"}
+    assert fields == {"category", "priority", "summary", "suggested_reply", "extracted", "proposed_events"}
     assert set(triage.Extracted.model_fields) == {"dates", "amounts", "names", "deadlines"}
 
 

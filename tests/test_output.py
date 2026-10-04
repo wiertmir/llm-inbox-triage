@@ -93,6 +93,23 @@ def test_render_without_reply_or_extracted_data():
     assert "Deadline" not in out
 
 
+def test_render_shows_calendar_proposals_without_claiming_creation():
+    result = make_result(
+        proposed_events=[triage.CalendarEvent(
+            title="Payment deadline",
+            start=date(2026, 8, 31),
+            end=date(2026, 9, 1),
+            description="Pay invoice #4471",
+        )],
+    )
+    out = render_to_text(result)
+    assert "Proposed calendar events" in out
+    assert "Payment deadline" in out
+    assert "2026-08-31" in out
+    assert "2026-09-01" in out
+    assert "Created" not in out
+
+
 # ---------------------------------------------------------------------------
 # 2. write_output() -> JSON file on disk
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ Usage:
     cat mail.txt | python triage.py --provider openai
     python triage.py sample.txt --json --out       # JSON to stdout and out/sample.out.json
     python triage.py sample.txt --json -o res.json # JSON to stdout and res.json
+    python triage.py sample.txt --create-events   # Model-selected Google Calendar entries
 """
 
 import argparse
@@ -32,9 +33,13 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from enum import Enum
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from loguru import logger
 
@@ -45,7 +50,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from pydantic.config import JsonDict
 from typing import Awaitable, Callable, Iterable, TypeVar
 
@@ -67,6 +72,17 @@ from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
 
 from dotenv import load_dotenv
+
+from google_calendar_auth import GoogleCalendarAuthError, get_google_calendar_access_token
+from me_calendar import MeCalendarError, build_me_event_body, create_me_calendar_entry
+from calendar_tools import (
+    CALENDAR_SYSTEM_PROMPT,
+    Calendar,
+    CalendarEvent,
+    CalendarToolError,
+    CreatedCalendarEvent,
+    validate_event_times,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +138,19 @@ class TriageResult(BaseModel):
         default=None, description="Short draft reply, or null if none is appropriate."
     )
     extracted: Extracted
+    proposed_events: list[CalendarEvent] = Field(
+        default_factory=list,
+        description="Calendar-ready meetings, appointments, or deadlines; empty if none are appropriate",
+    )
+
+    @model_validator(mode="after")
+    def validate_proposed_events(self) -> "TriageResult":
+        dates = set(self.extracted.dates) | set(self.extracted.deadlines)
+        for event in self.proposed_events:
+            start_date = event.start.date() if isinstance(event.start, datetime) else event.start
+            if start_date not in dates:
+                raise ValueError("Proposed event start must belong to extracted dates/deadlines")
+        return self
 
 class TriageRefusal(Exception):
     """The model declined or produced no structured output."""
@@ -129,6 +158,122 @@ class TriageRefusal(Exception):
 
 class MissingApiKey(Exception):
     """The provider's API key environment variable is not set."""
+
+
+class CalendarEntryError(Exception):
+    """Calendar event creation failed."""
+
+    def __init__(self, message: str, *, event_may_exist: bool = True) -> None:
+        super().__init__(message)
+        self.event_may_exist = event_may_exist
+
+
+def create_calendar_entry(
+    calendar: Calendar | str,
+    title: str,
+    start: date | datetime,
+    end: date | datetime,
+    description: str = "",
+    access_token: str | None = None,
+) -> dict[str, Any]:
+    """Create an event in Google, Me, or Hotmail/Outlook Calendar.
+
+    ``start`` and ``end`` must both be timezone-aware datetimes, or dates for
+    a Google all-day event (exclusive end date). Tokens may be passed directly
+    or supplied through GOOGLE_CALENDAR_ACCESS_TOKEN /
+    HOTMAIL_CALENDAR_ACCESS_TOKEN. Without a Google token, Desktop app OAuth
+    credentials from GOOGLE_CALENDAR_CLIENT_SECRETS_FILE are used to sign in
+    once, then reuse or refresh tokens from the OS credential store.
+    Me uses ME_BASE / ME_CA_FILE and its own PKCE sign-in with OS token caching.
+    """
+    calendar = Calendar(calendar)
+    validate_event_times(start, end)
+    if calendar == Calendar.me:
+        try:
+            return create_me_calendar_entry(title, start, end, description, access_token=access_token)
+        except MeCalendarError as exc:
+            raise CalendarEntryError(str(exc), event_may_exist=exc.event_may_exist) from exc
+    endpoints = {
+        Calendar.google: (
+            "GOOGLE_CALENDAR_ACCESS_TOKEN",
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+        ),
+        Calendar.hotmail: ("HOTMAIL_CALENDAR_ACCESS_TOKEN", "https://graph.microsoft.com/v1.0/me/events"),
+    }
+    if calendar == Calendar.hotmail and not isinstance(start, datetime):
+        raise ValueError("All-day events are currently supported only for Google Calendar")
+
+    token_env, endpoint = endpoints[calendar]
+    token = access_token or os.getenv(token_env)
+    if not token and calendar == Calendar.google:
+        try:
+            token = get_google_calendar_access_token()
+        except GoogleCalendarAuthError as exc:
+            raise CalendarEntryError(str(exc)) from exc
+    if not token:
+        raise CalendarEntryError(
+            f"No access token provided; pass access_token or set {token_env}"
+        )
+
+    if isinstance(start, datetime) and isinstance(end, datetime):
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+        start_data = {"dateTime": start_utc.isoformat(), "timeZone": "UTC"}
+        end_data = {"dateTime": end_utc.isoformat(), "timeZone": "UTC"}
+    else:
+        start_data = {"date": start.isoformat()}
+        end_data = {"date": end.isoformat()}
+    if calendar == Calendar.google:
+        event: dict[str, Any] = {
+            "summary": title,
+            "description": description,
+            "start": start_data,
+            "end": end_data,
+        }
+    else:
+        assert isinstance(start, datetime) and isinstance(end, datetime)
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+        event = {
+            "subject": title,
+            "body": {"contentType": "text", "content": description},
+            "start": {"dateTime": start_utc.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"},
+            "end": {"dateTime": end_utc.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"},
+        }
+
+    request = Request(
+        endpoint,
+        data=json.dumps(event).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            response_body = response.read()
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise CalendarEntryError(
+            f"{calendar} Calendar API returned HTTP {exc.code}: {body}"
+        ) from exc
+    except (URLError, TimeoutError) as exc:
+        raise CalendarEntryError(
+            f"{calendar} Calendar request failed; an event may already have been created: {exc}"
+        ) from exc
+
+    try:
+        created = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CalendarEntryError(
+            f"{calendar} Calendar API returned invalid JSON; an event may already have been created"
+        ) from exc
+    if not isinstance(created, dict) or not isinstance(created.get("id"), str) or not created["id"]:
+        raise CalendarEntryError(
+            f"{calendar} Calendar API returned no event ID; an event may already have been created"
+        )
+    return created
 
 
 # Note how short the system prompt is now: we no longer beg for JSON formatting.
@@ -144,6 +289,7 @@ Leave out dates you cannot pin down.
 
 For amounts, give the number and its ISO 4217 currency code; use {DEFAULT_CCY} if the
 message does not name a currency."""
+SYSTEM_PROMPT += "\n\n" + CALENDAR_SYSTEM_PROMPT
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 OUT_DIR = Path("out")
@@ -154,8 +300,8 @@ ANTHROPIC_MODEL = "claude-sonnet-5-5"
 OPENAI_KEY_ENV = "OPENAI_API_KEY"
 ANTHROPIC_KEY_ENV = "ANTHROPIC_API_KEY"
 
-# Room for the summary, reply and extracted lists; longer output gets cut off.
-ANTHROPIC_MAX_TOKENS = 2048
+# Room for the summary, reply, extracted lists and calendar proposals.
+ANTHROPIC_MAX_TOKENS = 4096
 
 # Per-request timeout. The SDK default is 10 minutes, which across all retry
 # attempts could keep the spinner going for nearly an hour on a stuck request.
@@ -378,6 +524,59 @@ async def triage_anthropic(text: str) -> TriageResult:
     return parsed
 
 
+async def create_events(
+    result: TriageResult, calendar: Calendar | str = Calendar.google,
+) -> list[CreatedCalendarEvent]:
+    """Create the first triage's proposals without any additional LLM requests."""
+    try:
+        calendar = Calendar(calendar)
+    except ValueError as exc:
+        raise CalendarToolError(f"Unknown calendar backend: {calendar}") from exc
+    if calendar not in (Calendar.google, Calendar.me):
+        raise CalendarToolError("Automatic event creation supports only Google Calendar or Me Calendar")
+    try:
+        validated = TriageResult.model_validate(result.model_dump())
+    except ValidationError as exc:
+        raise CalendarToolError("Invalid calendar proposals in the triage result; no events created") from exc
+    if calendar == Calendar.me:
+        try:
+            for event in validated.proposed_events:
+                build_me_event_body(event.title, event.start, event.end, event.description)
+        except MeCalendarError as exc:
+            raise CalendarToolError(f"Invalid Me Calendar proposal; no events created: {exc}") from exc
+    created: list[CreatedCalendarEvent] = []
+    seen: set[str] = set()
+    for event in validated.proposed_events:
+        key = event.model_dump_json()
+        if key in seen:
+            continue
+        try:
+            response = await asyncio.to_thread(
+                create_calendar_entry, calendar, event.title, event.start, event.end, event.description
+            )
+            entry = CreatedCalendarEvent(
+                **event.model_dump(), id=response["id"], url=response.get("htmlLink")
+            )
+        except (CalendarEntryError, ValidationError) as exc:
+            if isinstance(exc, CalendarEntryError) and not exc.event_may_exist:
+                status = "The current event was not created. "
+                guidance = (
+                    "Previously created events remain; check your calendar before rerunning."
+                    if created else "Correct the reported error before retrying."
+                )
+            else:
+                status = "The current event may also have been created. "
+                guidance = "Check your calendar before rerunning."
+            raise CalendarToolError(
+                f"Calendar creation failed after {len(created)} confirmed event(s): {exc}. "
+                f"{status}{guidance}"
+            ) from exc
+        created.append(entry)
+        seen.add(key)
+        logger.info("Created calendar event {id}: {title}", id=entry.id, title=entry.title)
+    return created
+
+
 # ---------------------------------------------------------------------------
 # 4. OUTPUT
 # ---------------------------------------------------------------------------
@@ -463,6 +662,15 @@ def render(result: TriageResult, console: Console | None = None) -> None:
     if table is not None:
         parts.append(Padding(table, (1, 0, 0, 0)))
 
+    if result.proposed_events:
+        proposals = Table(title="Proposed calendar events", box=box.SIMPLE, expand=True)
+        proposals.add_column("Title")
+        proposals.add_column("Start")
+        proposals.add_column("End (exclusive)")
+        for event in result.proposed_events:
+            proposals.add_row(Text(event.title), event.start.isoformat(), event.end.isoformat())
+        parts.append(Padding(proposals, (1, 0, 0, 0)))
+
     if result.suggested_reply:
         parts.append(
             Padding(
@@ -501,7 +709,19 @@ def default_out_path(input_path: str | None) -> Path:
     return OUT_DIR / f"{stem}.out.json"
 
 
-def write_output(result: TriageResult, path: Path) -> None:
+def output_json(
+    result: TriageResult, calendar_events: list[CreatedCalendarEvent] | None = None,
+) -> str:
+    data = result.model_dump(mode="json")
+    if calendar_events is not None:
+        data["calendar_events"] = [event.model_dump(mode="json") for event in calendar_events]
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def write_output(
+    result: TriageResult, path: Path,
+    calendar_events: list[CreatedCalendarEvent] | None = None,
+) -> None:
     """Save the result as JSON, creating parent folders as needed."""
     log = logger.opt(colors=True)
     path = path.resolve()
@@ -513,12 +733,33 @@ def write_output(result: TriageResult, path: Path) -> None:
     if path.exists():
         log.debug("Overwriting existing file <cyan>{path}</cyan>", path=path)
 
-    data = result.model_dump_json(indent=2) + "\n"
+    data = output_json(result, calendar_events) + "\n"
     path.write_text(data, encoding="utf-8")
     log.info("Wrote {size:,} bytes to <cyan>{path}</cyan>", size=len(data.encode("utf-8")), path=path)
 
 
-def main() -> int:
+class CliOptions(argparse.Namespace):
+    path: str | None
+    provider: str
+    calendar: Calendar
+    create_events: bool
+    json: bool
+    out: str | None
+
+
+class CliError(Exception):
+    """An expected CLI failure that should be reported without a traceback."""
+
+
+@dataclass(frozen=True)
+class Provider:
+    triage: Callable[[str], Awaitable[TriageResult]]
+    name: str
+    model: str
+    key_env: str
+
+
+def parse_arguments() -> tuple[argparse.ArgumentParser, CliOptions]:
     parser = argparse.ArgumentParser(description="LLM inbox triage")
     parser.add_argument("path", nargs="?", help="Text file to triage (default: stdin)")
     parser.add_argument(
@@ -526,6 +767,18 @@ def main() -> int:
         choices=["openai", "anthropic"],
         default="openai",
         help="Which LLM provider to use",
+    )
+    parser.add_argument(
+        "--calendar",
+        type=Calendar,
+        choices=[Calendar.google, Calendar.me],
+        default=Calendar.google,
+        help="Calendar backend for --create-events (default: google)",
+    )
+    parser.add_argument(
+        "--create-events",
+        action="store_true",
+        help="Authorize model-selected calendar writes without confirmation (Google or Me)",
     )
     parser.add_argument("--json", action="store_true", help="Print raw JSON only")
     parser.add_argument(
@@ -536,16 +789,18 @@ def main() -> int:
         metavar="PATH",
         help="With --json, also save the result to PATH (default: out/<input name>.out.json)",
     )
-    args = parser.parse_args()
-    # Pick up API keys from .env; variables already set in the environment win.
-    load_dotenv()
+    args = CliOptions()
+    parser.parse_args(namespace=args)
     if args.out is not None and not args.json:
         parser.error("--out requires --json")
     # "--out sample.txt" would take the input file as the output path and
     # overwrite it, so insist on a .json output name.
     if args.out and Path(args.out).suffix.lower() != ".json":
         parser.error(f"--out path must end in .json, got {args.out!r} (put the input file before --out)")
+    return parser, args
 
+
+def configure_logging(json_output: bool) -> None:
     # Log to logs/triage_YYYY-MM-DD.log at LOG_LEVEL (default DEBUG), starting
     # a new file at midnight. Warnings and errors are also echoed to stderr so
     # problems stay visible; with --json only errors are, so pipelines stay quiet.
@@ -561,75 +816,89 @@ def main() -> int:
     )
     logger.add(
         sys.stderr,
-        level="ERROR" if args.json else "WARNING",
+        level="ERROR" if json_output else "WARNING",
         format="<level>{level: <8}</level> | <level>{message}</level>",
     )
 
-    source = args.path or "stdin"
+
+def read_cli_input(parser: argparse.ArgumentParser, path: str | None) -> str:
+    source = path or "stdin"
     try:
-        text = read_input(args.path)
+        text = read_input(path)
     except FileNotFoundError:
-        parser.error(f"File not found: {args.path}")
+        parser.error(f"File not found: {path}")
     except UnicodeDecodeError:
         parser.error(f"Cannot read {source}: not UTF-8 text")
     except OSError as exc:  # a directory, no permission, ...
         # Windows reports a directory as "Permission denied", so name it ourselves.
         reason = "is a directory" if Path(source).is_dir() else exc.strerror or exc
         parser.error(f"Cannot read {source}: {reason}")
-    except KeyboardInterrupt:
-        logger.warning("Interrupted")
-        return 130
-
     if not text.strip():
-        logger.error("Nothing to triage: {source} is empty", source=source)
-        return 1
+        raise CliError(f"Nothing to triage: {source} is empty")
+    return text
 
-    triage: Callable[[str], Awaitable[TriageResult]]
-    if args.provider == "openai":
-        triage, provider_name, model = triage_openai, "OpenAI", OPENAI_MODEL
-        key_env = OPENAI_KEY_ENV
-    else:
-        triage, provider_name, model = triage_anthropic, "Anthropic", ANTHROPIC_MODEL
-        key_env = ANTHROPIC_KEY_ENV
 
+def select_provider(name: str) -> Provider:
+    if name == "openai":
+        return Provider(triage_openai, "OpenAI", OPENAI_MODEL, OPENAI_KEY_ENV)
+    if name == "anthropic":
+        return Provider(triage_anthropic, "Anthropic", ANTHROPIC_MODEL, ANTHROPIC_KEY_ENV)
+    raise CliError(f"Unknown LLM provider: {name}")
+
+
+def run_triage(text: str, provider: Provider, console: Console) -> TriageResult:
     # Spinner and timing go to stderr, and are silenced entirely with --json
     # so the output can be part of a pipeline.
-    status_console = Console(stderr=True, quiet=args.json)
     status_text = (
         f"[bold]📨 Triaging message[/bold] ({len(text):,} chars) · "
-        f"waiting for [cyan]{model}[/cyan] on {provider_name}…"
+        f"waiting for [cyan]{provider.model}[/cyan] on {provider.name}…"
     )
     started = time.perf_counter()
     try:
-        with status_console.status(status_text, spinner="dots"):
-            result = asyncio.run(triage(text))
-    except KeyboardInterrupt:
-        logger.warning("Interrupted")
-        return 130
-    except (TriageRefusal, MissingApiKey) as exc:
-        logger.error("{}", exc)
-        return 1
+        with console.status(status_text, spinner="dots"):
+            result = asyncio.run(provider.triage(text))
     except (openai.AuthenticationError, anthropic.AuthenticationError) as exc:
-        logger.error("{provider} rejected the API key - check {env}: {error}",
-                     provider=provider_name, env=key_env, error=_describe_error(exc))
-        return 1
+        raise CliError(
+            f"{provider.name} rejected the API key - check {provider.key_env}: {_describe_error(exc)}"
+        ) from exc
     except (openai.APIError, anthropic.APIError) as exc:
         if _is_transient(exc):
-            logger.error("{provider} still failing after {n} attempts, giving up: {error}",
-                         provider=provider_name, n=MAX_ATTEMPTS, error=_describe_error(exc))
+            message = (
+                f"{provider.name} still failing after {MAX_ATTEMPTS} attempts, "
+                f"giving up: {_describe_error(exc)}"
+            )
         else:
-            logger.error("{provider} request failed: {error}",
-                         provider=provider_name, error=_describe_error(exc))
-        return 1
+            message = f"{provider.name} request failed: {_describe_error(exc)}"
+        raise CliError(message) from exc
     except (ValidationError, json.JSONDecodeError) as exc:
-        logger.error("{provider} returned malformed output that does not match TriageResult",
-                     provider=provider_name)
         logger.debug("Malformed output details: {error}", error=exc)
-        return 1
+        raise CliError(
+            f"{provider.name} returned malformed output that does not match TriageResult"
+        ) from exc
     elapsed = time.perf_counter() - started
-    logger.info("Got response from {model} in {elapsed:.1f}s", model=model, elapsed=elapsed)
-    status_console.print(f"[green]✓[/green] Response from [cyan]{model}[/cyan] in {elapsed:.1f}s", highlight=False)
+    logger.info("Got response from {model} in {elapsed:.1f}s", model=provider.model, elapsed=elapsed)
+    console.print(
+        f"[green]✓[/green] Response from [cyan]{provider.model}[/cyan] in {elapsed:.1f}s",
+        highlight=False,
+    )
+    return result
 
+
+def run_calendar_creation(
+    result: TriageResult, calendar: Calendar, console: Console,
+) -> list[CreatedCalendarEvent]:
+    with console.status("Creating calendar events from triage proposals...", spinner="dots"):
+        calendar_events = asyncio.run(create_events(result, calendar))
+    console.print(f"Created {len(calendar_events)} {calendar.label} event(s).", highlight=False)
+    for event in calendar_events:
+        console.print(Text(f"{event.title}: {event.start.isoformat()} (ID: {event.id})"))
+    return calendar_events
+
+
+def save_cli_output(
+    args: CliOptions, result: TriageResult,
+    calendar_events: list[CreatedCalendarEvent] | None,
+) -> None:
     if args.out is not None:
         if args.out:
             out_path = Path(args.out)
@@ -639,18 +908,50 @@ def main() -> int:
                 "No --out path given, using default <cyan>{path}</cyan>", path=out_path
             )
         try:
-            write_output(result, out_path)
+            write_output(result, out_path, calendar_events)
         except OSError as exc:
-            logger.error("Cannot write {path}: {error}", path=out_path, error=exc)
-            return 1
+            message = f"Cannot write {out_path}: {exc}"
+            if calendar_events:
+                message += (
+                    f"; {len(calendar_events)} calendar event(s) were already created; "
+                    "check your calendar before rerunning"
+                )
+            raise CliError(message) from exc
 
-    if args.json:
+
+def print_cli_output(
+    result: TriageResult, json_output: bool,
+    calendar_events: list[CreatedCalendarEvent] | None,
+) -> None:
+    if json_output:
         logger.debug("Printing JSON result to stdout")
-        print(result.model_dump_json(indent=2))
+        print(output_json(result, calendar_events))
     else:
         logger.debug("Rendering result card")
         render(result)
 
+
+def main() -> int:
+    parser, args = parse_arguments()
+    load_dotenv()
+    configure_logging(args.json)
+    console = Console(stderr=True, quiet=args.json)
+    try:
+        text = read_cli_input(parser, args.path)
+        result = run_triage(text, select_provider(args.provider), console)
+        calendar_events = (
+            run_calendar_creation(result, args.calendar, console) if args.create_events else None
+        )
+        save_cli_output(args, result, calendar_events)
+        print_cli_output(result, args.json, calendar_events)
+    except KeyboardInterrupt:
+        logger.warning(
+            "Interrupted; check your calendar before rerunning" if args.create_events else "Interrupted"
+        )
+        return 130
+    except (CliError, TriageRefusal, MissingApiKey, CalendarToolError, CalendarEntryError) as exc:
+        logger.error("{}", exc)
+        return 1
     return 0
 
 
