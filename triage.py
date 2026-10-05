@@ -31,6 +31,7 @@ Usage:
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import math
 import os
@@ -38,12 +39,14 @@ import sys
 import time
 from dataclasses import dataclass
 from contextvars import ContextVar
+from functools import partial
 from enum import Enum
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit, urlunsplit
 
 from loguru import logger
 
@@ -54,6 +57,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.markup import escape
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from pydantic.config import JsonDict
@@ -320,6 +324,8 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 # Retry policy for transient API errors: up to 5 attempts, waiting about
 # 1s, 2s, 4s, 8s in between (plus up to 1s of jitter), i.e. ~15-19s in total.
 MAX_ATTEMPTS = 5
+BATCH_INITIAL_STATUS_ROWS = 15
+IS_WINDOWS = sys.platform == "win32"
 BACKOFF_MAX_SECONDS = 20
 # Same status codes the SDKs themselves retry; any 5xx (incl. 529 overloaded) too.
 RETRYABLE_STATUS = {408, 409, 429}
@@ -482,7 +488,7 @@ def _refusal_text(response: ParsedResponse[TriageAnalysis]) -> str | None:
 
     return None
 
-async def triage_openai(text: str) -> TriageAnalysis:
+async def triage_openai(text: str, model: str | None = None) -> TriageAnalysis:
     """Call OpenAI with Structured Outputs; the application supplies the result ID."""
     logger.info("Using OpenAI provider")
     _require_key(OPENAI_KEY_ENV)
@@ -495,11 +501,12 @@ async def triage_openai(text: str) -> TriageAnalysis:
         {'role': 'user', 'content': text},
     ]
 
-    logger.info("Using AI model: {model}", model=OPENAI_MODEL)
+    selected_model = model if model is not None else OPENAI_MODEL
+    logger.info("Using AI model: {model}", model=selected_model)
     response = await _with_retry(
         "OpenAI",
         lambda: client.responses.parse(
-            model=OPENAI_MODEL,
+            model=selected_model,
             input=messages,
             text_format=TriageAnalysis
         ),
@@ -519,7 +526,7 @@ async def triage_openai(text: str) -> TriageAnalysis:
     return parsed
 
 
-async def triage_anthropic(text: str) -> TriageAnalysis:
+async def triage_anthropic(text: str, model: str | None = None) -> TriageAnalysis:
     """Call Anthropic and return a validated TriageAnalysis.
     """
     logger.info("Using Anthropic provider")
@@ -532,12 +539,13 @@ async def triage_anthropic(text: str) -> TriageAnalysis:
         {'role': 'user', 'content': text}
     ]
 
-    logger.info("Using AI model: {model}", model=ANTHROPIC_MODEL)
+    selected_model = model if model is not None else ANTHROPIC_MODEL
+    logger.info("Using AI model: {model}", model=selected_model)
 
     response = await _with_retry(
         "Anthropic",
         lambda: client.messages.parse(
-            model=ANTHROPIC_MODEL,
+            model=selected_model,
             system=SYSTEM_PROMPT,
             max_tokens=ANTHROPIC_MAX_TOKENS,
             messages=messages,
@@ -560,6 +568,41 @@ async def triage_anthropic(text: str) -> TriageAnalysis:
         )
 
     return parsed
+
+
+async def triage_ollama(text: str, model: str, base_url: str) -> TriageAnalysis:
+    logger.info("Using Ollama model {model} at {url}", model=model, url=base_url)
+    client = AsyncOpenAI(
+        base_url=base_url, api_key="ollama", max_retries=0, timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    try:
+        response = await _with_retry(
+            "Ollama",
+            lambda: client.chat.completions.parse(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                response_format=TriageAnalysis,
+                temperature=0,
+            ),
+            close=client.close,
+        )
+    except openai.LengthFinishReasonError as exc:
+        raise TriageRefusal("Ollama model output was cut off before completion") from exc
+    except openai.ContentFilterFinishReasonError as exc:
+        raise TriageRefusal("Ollama model output was blocked by a content filter") from exc
+    if not response.choices:
+        raise TriageRefusal("Ollama returned no completion choices")
+    choice = response.choices[0]
+    if choice.message.refusal:
+        raise TriageRefusal(f"Ollama model refused: {choice.message.refusal}")
+    if choice.finish_reason != "stop":
+        raise TriageRefusal(f"Ollama output did not complete (finish_reason={choice.finish_reason})")
+    if choice.message.parsed is None:
+        raise TriageRefusal("Ollama returned no structured triage output")
+    return choice.message.parsed
 
 
 async def create_events(
@@ -811,12 +854,17 @@ def write_output(
     log.info("Wrote {size:,} bytes to <cyan>{path}</cyan>", size=len(data.encode("utf-8")), path=path)
 
 
-class CliOptions(argparse.Namespace):
+class ModelOptions(argparse.Namespace):
+    provider: str
+    model: str | None
+    ollama: str | None
+
+
+class CliOptions(ModelOptions):
     path: str | None
     batch: str | None
     jobs: int
     request_interval: float
-    provider: str
     calendar: Calendar
     create_events: bool
     json: bool
@@ -832,7 +880,7 @@ class Provider:
     triage: Callable[[str], Awaitable[TriageAnalysis]]
     name: str
     model: str
-    key_env: str
+    key_env: str | None
 
 
 def positive_jobs(value: str) -> int:
@@ -855,6 +903,73 @@ def positive_interval(value: str) -> float:
     return interval
 
 
+def model_name(value: str) -> str:
+    model = value.strip()
+    if not model:
+        raise argparse.ArgumentTypeError("model must not be empty")
+    return model
+
+
+def ollama_base_url(value: str) -> str:
+    host = value.strip()
+    if not host:
+        raise argparse.ArgumentTypeError("Ollama host must not be empty")
+    if any(char.isspace() for char in host) or "\\" in host:
+        raise argparse.ArgumentTypeError("Ollama host must not contain whitespace or backslashes")
+    if "://" not in host:
+        try:
+            address = ipaddress.IPv6Address(host)
+        except ValueError:
+            authority = host
+        else:
+            authority = f"[{address}]"
+        host = f"http://{authority}"
+    try:
+        parsed = urlsplit(host)
+        hostname = parsed.hostname
+        port = parsed.port if parsed.port is not None else 11434
+        if (
+            parsed.scheme not in ("http", "https") or not hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or parsed.path not in ("", "/", "/v1", "/v1/")
+            or parsed.netloc.endswith(":")
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError("expected a hostname/IP, optional port, or HTTP(S) URL ending in /v1")
+        if ":" in hostname:
+            hostname = f"[{ipaddress.IPv6Address(hostname)}]"
+        else:
+            hostname = hostname.encode("idna").decode("ascii")
+            if any(char.isspace() for char in hostname) or any(char in hostname for char in "\\%"):
+                raise ValueError("invalid hostname")
+        return urlunsplit((parsed.scheme, f"{hostname}:{port}", "/v1", "", ""))
+    except (ValueError, UnicodeError) as exc:
+        raise argparse.ArgumentTypeError(f"Invalid Ollama host {value!r}: {exc}") from exc
+
+
+def add_model_arguments(parser: argparse.ArgumentParser) -> None:
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument(
+        "--provider", choices=["openai", "anthropic"],
+        help="Cloud LLM provider (default: openai; cannot be combined with --ollama)",
+    )
+    backend.add_argument(
+        "--ollama", type=ollama_base_url, metavar="HOST",
+        help="Ollama hostname/IP or HTTP(S) URL (default port: 11434; requires --model)",
+    )
+    parser.add_argument(
+        "--model", type=model_name,
+        help="Override the provider model; required with --ollama",
+    )
+
+
+def validate_model_arguments(parser: argparse.ArgumentParser, args: ModelOptions) -> None:
+    if args.ollama is not None and args.model is None:
+        parser.error("--ollama requires --model")
+    if args.provider is None:
+        args.provider = "openai"
+
+
 def parse_arguments() -> tuple[argparse.ArgumentParser, CliOptions]:
     parser = argparse.ArgumentParser(description="LLM inbox triage")
     input_group = parser.add_mutually_exclusive_group()
@@ -872,12 +987,7 @@ def parse_arguments() -> tuple[argparse.ArgumentParser, CliOptions]:
         "--request-interval", type=positive_interval, metavar="SECONDS",
         help="Minimum time between batch AI request starts, including retries (default: 1)",
     )
-    parser.add_argument(
-        "--provider",
-        choices=["openai", "anthropic"],
-        default="openai",
-        help="Which LLM provider to use",
-    )
+    add_model_arguments(parser)
     parser.add_argument(
         "--calendar",
         type=Calendar,
@@ -901,6 +1011,7 @@ def parse_arguments() -> tuple[argparse.ArgumentParser, CliOptions]:
     )
     args = CliOptions()
     parser.parse_args(namespace=args)
+    validate_model_arguments(parser, args)
     if args.batch is None and (args.jobs is not None or args.request_interval is not None):
         parser.error("--jobs and --request-interval require --batch")
     args.jobs = args.jobs if args.jobs is not None else 3
@@ -935,6 +1046,50 @@ def configure_logging(json_output: bool) -> None:
     )
 
 
+def enable_stderr_vt() -> bool:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    try:
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(sys.stderr.fileno()))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (OSError, ValueError) as exc:
+        logger.debug("Cannot access stderr console handle: {}", exc)
+        return False
+    get_mode = kernel32.GetConsoleMode
+    get_mode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_mode.restype = wintypes.BOOL
+    set_mode = kernel32.SetConsoleMode
+    set_mode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    set_mode.restype = wintypes.BOOL
+    mode = wintypes.DWORD()
+    if not get_mode(handle, ctypes.byref(mode)):
+        logger.debug("GetConsoleMode(stderr) failed with Windows error {}", ctypes.get_last_error())
+        return False
+    enable_virtual_terminal_processing = 0x0004
+    if mode.value & enable_virtual_terminal_processing:
+        return True
+    if not set_mode(handle, mode.value | enable_virtual_terminal_processing):
+        logger.debug("SetConsoleMode(stderr) failed with Windows error {}", ctypes.get_last_error())
+        return False
+    return True
+
+
+def status_console(quiet: bool) -> Console:
+    if quiet or not IS_WINDOWS or sys.stdout.isatty() or not sys.stderr.isatty():
+        return Console(stderr=True, quiet=quiet)
+    # Rich's legacy Windows renderer targets stdout, which may be a JSON pipe.
+    if enable_stderr_vt():
+        return Console(stderr=True, legacy_windows=False)
+    console = Console(stderr=True, legacy_windows=False, force_terminal=False)
+    console.print(Text(
+        "WARNING | Live terminal redraw is unavailable; showing final status rows only.",
+        style="yellow",
+    ))
+    return console
+
+
 def read_cli_input(parser: argparse.ArgumentParser, path: str | None) -> str:
     source = path or "stdin"
     try:
@@ -952,11 +1107,17 @@ def read_cli_input(parser: argparse.ArgumentParser, path: str | None) -> str:
     return text
 
 
-def select_provider(name: str) -> Provider:
+def select_provider(name: str, model: str | None = None, ollama: str | None = None) -> Provider:
+    if ollama is not None:
+        if model is None:
+            raise CliError("--ollama requires --model")
+        return Provider(partial(triage_ollama, model=model, base_url=ollama), "Ollama", model, None)
     if name == "openai":
-        return Provider(triage_openai, "OpenAI", OPENAI_MODEL, OPENAI_KEY_ENV)
+        call = triage_openai if model is None else partial(triage_openai, model=model)
+        return Provider(call, "OpenAI", model if model is not None else OPENAI_MODEL, OPENAI_KEY_ENV)
     if name == "anthropic":
-        return Provider(triage_anthropic, "Anthropic", ANTHROPIC_MODEL, ANTHROPIC_KEY_ENV)
+        call = triage_anthropic if model is None else partial(triage_anthropic, model=model)
+        return Provider(call, "Anthropic", model if model is not None else ANTHROPIC_MODEL, ANTHROPIC_KEY_ENV)
     raise CliError(f"Unknown LLM provider: {name}")
 
 
@@ -964,6 +1125,8 @@ async def analyze_message(text: str, provider: Provider) -> TriageAnalysis:
     try:
         return await provider.triage(text)
     except (openai.AuthenticationError, anthropic.AuthenticationError) as exc:
+        if provider.key_env is None:
+            raise CliError(f"{provider.name} authentication failed: {_describe_error(exc)}") from exc
         raise CliError(
             f"{provider.name} rejected the API key - check {provider.key_env}: {_describe_error(exc)}"
         ) from exc
@@ -995,7 +1158,7 @@ def run_triage(text: str, provider: Provider, console: Console) -> TriageAnalysi
     # so the output can be part of a pipeline.
     status_text = (
         f"[bold]📨 Triaging message[/bold] ({len(text):,} chars) · "
-        f"waiting for [cyan]{provider.model}[/cyan] on {provider.name}…"
+        f"waiting for [cyan]{escape(provider.model)}[/cyan] on {escape(provider.name)}…"
     )
     started = time.perf_counter()
     with console.status(status_text, spinner="dots"):
@@ -1003,7 +1166,7 @@ def run_triage(text: str, provider: Provider, console: Console) -> TriageAnalysi
     elapsed = time.perf_counter() - started
     logger.info("Got response from {model} in {elapsed:.1f}s", model=provider.model, elapsed=elapsed)
     console.print(
-        f"[green]✓[/green] Response from [cyan]{provider.model}[/cyan] in {elapsed:.1f}s",
+        f"[green]✓[/green] Response from [cyan]{escape(provider.model)}[/cyan] in {elapsed:.1f}s",
         highlight=False,
     )
     return result
@@ -1076,7 +1239,14 @@ async def process_batch(
     files: list[Path], args: CliOptions, provider: Provider, progress: Progress,
 ) -> BatchReport:
     outcomes: dict[Path, BatchItem | BatchError] = {}
-    tasks = {path: progress.add_task(path.name, total=1, state="Queued", start=False) for path in files}
+    tasks = {
+        path: progress.add_task(
+            path.name, total=1, state="Queued", start=False,
+            visible=index < BATCH_INITIAL_STATUS_ROWS,
+        )
+        for index, path in enumerate(files)
+    }
+    remaining_rows = iter(files[BATCH_INITIAL_STATUS_ROWS:])
     pending = iter(files)
     calendar_lock = asyncio.Lock()
 
@@ -1109,6 +1279,10 @@ async def process_batch(
                 progress.update(task, completed=1, state="Failed")
             finally:
                 progress.stop_task(task)
+                if path in outcomes:
+                    next_row = next(remaining_rows, None)
+                    if next_row is not None:
+                        progress.update(tasks[next_row], visible=True)
 
     token = _request_throttle.set(RequestThrottle(args.request_interval))
     try:
@@ -1178,7 +1352,8 @@ def run_batch(args: CliOptions, console: Console) -> int:
         SpinnerColumn(finished_text=""), TextColumn("{task.description}", markup=False),
         TextColumn("{task.fields[state]}"), TimeElapsedColumn(), console=console,
     ) as progress:
-        report = asyncio.run(process_batch(files, args, select_provider(args.provider), progress))
+        provider = select_provider(args.provider, args.model, args.ollama)
+        report = asyncio.run(process_batch(files, args, provider, progress))
     print_batch_summary(report, console)
     out_path = Path(args.out) if args.out else OUT_DIR / f"{Path(args.batch).resolve().name}.out.json"
     try:
@@ -1195,7 +1370,8 @@ def run_batch(args: CliOptions, console: Console) -> int:
 
 def run_single(parser: argparse.ArgumentParser, args: CliOptions, console: Console) -> None:
     text = read_cli_input(parser, args.path)
-    result = identified_result(run_triage(text, select_provider(args.provider), console), args.path)
+    provider = select_provider(args.provider, args.model, args.ollama)
+    result = identified_result(run_triage(text, provider, console), args.path)
     calendar_events = (
         run_calendar_creation(result, args.calendar, console) if args.create_events else None
     )
@@ -1207,7 +1383,7 @@ def main() -> int:
     parser, args = parse_arguments()
     load_dotenv()
     configure_logging(args.json)
-    console = Console(stderr=True, quiet=args.json and args.batch is None)
+    console = status_console(quiet=args.json and args.batch is None)
     try:
         if args.batch is not None:
             return run_batch(args, console)

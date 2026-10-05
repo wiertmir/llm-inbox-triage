@@ -9,6 +9,78 @@ python triage.py sample.txt
 python triage.py sample.txt --provider anthropic
 ```
 
+**Now included:** OpenAI, Anthropic, and local Ollama models; throttled batch
+processing with a signal summary; and a standalone evaluator with 20 labeled
+samples and detailed accuracy reporting.
+
+[Model selection and Ollama](#model-selection-and-ollama) |
+[Batch processing](#batch-processing-7) |
+[Quickstart](#-quickstart) |
+[Evaluation harness](#evaluation-harness-8)
+
+### Single-file output
+
+Without `--json`, the terminal card shows the category, priority, extracted
+fields, proposed calendar events, and suggested reply:
+
+![Single-file triage with priority, extracted fields, calendar proposals, and a reply draft](docs/screenshots/No_extra_params.png)
+
+For machine-readable output, add `--json`; use `--out` to save it as well:
+
+```powershell
+python triage.py .\sample.txt --json
+python triage.py .\sample.txt --json --out .\out\sample.out.json
+```
+
+![Structured JSON result with extracted fields, proposed events, and the input filename ID](docs/screenshots/As_JSON.png)
+
+### Model selection and Ollama
+
+Both CLIs accept `--model NAME` to override the selected provider's model.
+Without it, OpenAI and Anthropic retain their existing defaults:
+
+```powershell
+python triage.py sample.txt --provider openai --model gpt-5.6
+python triage.py sample.txt --provider anthropic --model claude-sonnet-5-5
+python eval_triage.py --provider anthropic --model claude-sonnet-5-5
+```
+
+Use `--ollama HOST` instead of `--provider` to call an Ollama daemon's
+OpenAI-compatible endpoint. These options are **mutually exclusive**, including
+an explicit `--provider openai`. Ollama **requires `--model`**, since available
+models depend on the host:
+
+```powershell
+python triage.py sample.txt --ollama=pop-os.local --model qwen3.6:35b
+python triage.py --batch .\evals\samples --ollama=pop-os.local --model qwen3.6:35b --json
+python eval_triage.py --ollama=pop-os.local --model qwen3.6:35b
+python eval_triage.py --ollama=pop-os.local --model qwen3.6:35b --jobs 1
+```
+
+Use `--jobs 1` to process evaluation samples **one at a time**. This controls
+concurrent requests, not the Ollama model's internal CPU/GPU threads. The default
+minimum request-start interval remains 1 second; change it with
+`--request-interval SECONDS`.
+
+A bare hostname/IP defaults to `http://HOST:11434/v1`. Optional ports and
+HTTP(S) URLs with an optional `/v1` suffix are accepted; omitted ports still
+default to 11434. IPv6 addresses are supported (bracket them when specifying
+a port), for example `--ollama="[::1]:11434"`. URL credentials, query strings,
+fragments, and non-`/v1` paths are rejected.
+
+Ollama uses async OpenAI-compatible **chat completions** with a JSON-schema
+response format and Pydantic validation, not the cloud Responses API. The local
+model/server must support structured outputs; invalid output or unsupported
+models/formats are reported explicitly without falling back to free-form text
+or another provider. No OpenAI API key is needed: the SDK receives a dummy
+`ollama` key, which an ordinary local Ollama daemon ignores. This targets daemon
+hosts, not Ollama's direct cloud service, which does not currently support
+structured outputs.
+
+Model overrides and Ollama work with file/stdin input, batching, throttling,
+retries, and optional calendar creation. The evaluator forwards the chosen
+backend and model and includes both in its report.
+
 ### Batch processing (#7)
 
 Use `--batch <dir>` to process every `.txt` file directly in a directory
@@ -33,8 +105,11 @@ backoff and bounded `Retry-After` handling. These are request-rate controls,
 not token quotas: tune them for your provider/model's limits. Each SDK client
 is closed after its request/retry sequence.
 
-All filenames have their own simultaneous status line (queued, waiting for AI,
-done, or failed), followed by a counts-per-category summary on **stderr**.
+Initially up to **15 file-status rows** are visible (queued, waiting for AI,
+done, or failed). Each completed or failed file reveals one additional row
+until all filenames are displayed. Completed rows stay visible, so the display
+grows gradually rather than showing the entire batch immediately. This does
+not change API concurrency. A counts-per-category summary follows on **stderr**.
 The summary uses category colors and icons (plain labels on legacy encodings),
 highlights failures, and includes
 per-category and overall counts for **Dates**, **Amounts**, and **Reply needed**.
@@ -44,8 +119,15 @@ reply needed means a nonblank `suggested_reply`. Failed files have unknown
 signals (shown as `-`) and are excluded from signal totals.
 Without `--json`, batch mode prints no individual triage cards; its console
 output is limited to status lines and the summary table (plus any error messages).
+
+![Completed batch status rows and a summary of categories, dates, amounts, and reply-needed signals](docs/screenshots/batch_mode.png)
+
 These remain visible with `--json`; stdout contains only one JSON document.
 For redirected/noninteractive stderr, Rich prints the final status rows.
+On Windows with stdout piped (including the evaluator), live redraw uses the
+actual stderr terminal's ANSI support rather than Rich's stdout-based legacy
+renderer. If that terminal cannot support redraw, a warning is printed and
+only final status rows are shown, avoiding repeated blocks.
 Successful results and errors are ordered by filename, not completion time.
 
 Batch mode always saves **one aggregate JSON**, by default to
@@ -280,13 +362,13 @@ Given raw text, it returns:
 
 It touches everything required at the LLM fundamentals stage:
 
-- **LLM APIs** — OpenAI (Responses API) and Anthropic
-- **Structured Outputs** — a Pydantic schema the API *guarantees*, not "please return JSON" + `json.loads` and a prayer
+- **LLM APIs** — OpenAI (Responses API), Anthropic, and Ollama (OpenAI-compatible chat completions)
+- **Structured Outputs** — schema-constrained responses validated with Pydantic, not "please return JSON" + `json.loads` and a prayer
 - **Actions** — optionally create calendar entries from the first triage's structured proposals
 - **Prompt engineering** — a short system prompt describing the *task*, while the schema enforces the *shape*
-- **Evals** — a mini eval harness that measures categorization accuracy (the 2026 differentiator)
-- **Production hygiene** — error handling, retries, refusal handling, cost awareness
-- **Multi-provider** — same logic runs on OpenAI *and* Anthropic
+- **Evals** — category, extracted-field, and exact-sample accuracy against 20 labeled messages
+- **Production hygiene** — error handling, retries, refusal handling, throttled concurrency, cost awareness
+- **Multi-provider** — the same workflow runs on OpenAI, Anthropic, and local Ollama models
 
 It's also the seed for later projects: add RAG (Project 2) so it knows the context of past mail, then turn it into an agent (Project 3).
 
@@ -310,7 +392,106 @@ export ANTHROPIC_API_KEY=sk-ant-...
 python triage.py sample.txt
 ```
 
-## Evaluation samples (issue #8 preparation)
+For **local Ollama**, install and serve your chosen model on the target host,
+then run without cloud API keys:
+
+```powershell
+python triage.py .\sample.txt --ollama=pop-os.local --model qwen3.6:35b
+python eval_triage.py --ollama=pop-os.local --model qwen3.6:35b --jobs 1
+```
+
+Replace the host and model with your own. The existing dependencies include the
+OpenAI-compatible client; no separate Python Ollama package is needed.
+
+## Evaluation harness (#8)
+
+Run the standalone [eval_triage.py](eval_triage.py) script to measure quality
+after changing a prompt or model:
+
+```powershell
+python eval_triage.py
+python eval_triage.py --provider anthropic
+python eval_triage.py --provider openai --jobs 2 --request-interval 2
+python eval_triage.py --ollama=pop-os.local --model qwen3.6:35b
+python eval_triage.py --ollama=pop-os.local --model qwen3.6:35b --jobs 1
+```
+
+By default it loads [evals/expected.json](evals/expected.json), validates the
+dataset, and launches `triage.py --batch=<absolute path to evals\samples> --json`
+using the same Python interpreter. Provider/Ollama, model, and throttling options
+are forwarded.
+The child runs from the repository root, streams its status/summary to stderr,
+and inherits the same initial **15 visible status rows**, revealing one more
+per completed or failed file while keeping completed rows visible,
+and saves the aggregate to `out/samples.out.json` as usual. Its stdout is captured
+as UTF-8 JSON; the evaluator prints its accuracy report to stdout. Cloud evaluation
+requires the selected provider's API credentials and incurs normal provider
+costs. Ollama evaluation requires a reachable daemon with the selected model,
+not an OpenAI API key. It never enables calendar writes.
+
+To rescore saved output without making any new API calls:
+
+```powershell
+python eval_triage.py --results .\out\samples.out.json
+```
+
+`--expected PATH` selects another version-1 manifest. All listed `.txt` files
+must be present directly in one directory under the manifest's folder. Duplicate
+IDs/filenames, missing files, and unlabeled `.txt` files are rejected before
+starting an API run. Results match labels by input **filename including extension**,
+not the manifest's extensionless fixture ID. Unlabeled or duplicate result/error
+IDs and malformed JSON fail explicitly.
+
+The Rich report includes an overview, exact numerators/denominators and
+percentages, category accuracy, and expected/actual details for mismatches
+and execution failures:
+
+- **Category accuracy:** exact category matches divided by all labeled samples.
+- **Dates / Amounts / Names / Deadlines:** one exact set-match check per field
+  per sample. Order and duplicate values are ignored; missing or extra values
+  fail that field. Empty expected lists also require empty actual lists.
+- **Key fields:** passed field checks divided by `4 * labeled samples`.
+- **Exact sample:** category and all four fields must match.
+
+Money matches both numeric value and currency exactly; integer/float
+representations of the same numeric value match. Names and currency codes are
+case-sensitive; dates retain their ISO calendar-day meaning. Priorities,
+summaries, replies, and calendar proposals are not scored.
+
+**Failed or missing results remain in every denominator and fail every check**,
+so API errors cannot inflate accuracy. A zero-support category displays `N/A`.
+The evaluator still scores valid partial JSON when the child exits nonzero.
+Execution/validation failures or missing samples exit **1**, interruption exits
+**130**, and a completed evaluation exits **0** even if accuracy is below 100%
+(this reports quality; it does not impose an accuracy threshold).
+
+### Example evaluation report
+
+These supplied screenshots show a local `qwen3.6:35b` run through Ollama with
+`--jobs 1`: file progress, the batch summary, backend/model metadata, accuracy
+metrics, per-category results, and expected/actual mismatch details.
+
+![Ollama evaluation output, part 1](docs/screenshots/eval_01.png)
+
+![Ollama evaluation output, part 2](docs/screenshots/eval_02.png)
+
+The captured run completed all 20 samples with no execution failures:
+
+| Metric | Correct / Total | Accuracy |
+|--------|-----------------|----------|
+| Category | 12 / 20 | 60.0% |
+| Dates | 19 / 20 | 95.0% |
+| Amounts | 20 / 20 | 100.0% |
+| Names | 19 / 20 | 95.0% |
+| Deadlines | 20 / 20 | 100.0% |
+| Key fields | 78 / 80 | 97.5% |
+| Exact sample | 11 / 20 | 55.0% |
+
+This is **one illustrative run on a small synthetic dataset**, not a general
+benchmark or a comparison with cloud models. Scores can change with the prompt,
+model, and server configuration; rerun the evaluator for your setup.
+
+### Labeled samples
 
 [evals/samples](evals/samples) contains 20 synthetic messages, separate from
 the original `sample.txt`. [evals/expected.json](evals/expected.json) labels
@@ -325,7 +506,7 @@ messages and entities are fictional; no real inbox data is included.
 
 The manifest has `schema_version: 1` and a `samples` array. Each entry contains
 a unique `id`, a `file` path relative to the manifest, and an `expected` object.
-For a future runner, compare categories exactly and extracted lists as unordered
+The evaluator compares categories exactly and extracted lists as unordered
 sets of values, including empty lists (unexpected extra values are mismatches).
 Dates use ISO `YYYY-MM-DD`; money values pair a numeric amount with an ISO currency
 code. Names retain their spelling and capitalization. Summaries, priorities,
@@ -338,27 +519,41 @@ python triage.py .\evals\samples\04_invoice_jpy.txt --json
 ```
 
 These are hand-authored expected labels, not recorded model outputs or measured
-accuracy. The evaluation runner and accuracy reporting from issue #8 are not
-implemented yet. Batch results can be matched to labels using each manifest
-entry's input filename, rather than its extensionless fixture `id`. Offline fixture
-integrity checks run with `python -m pytest tests\test_evals.py` without API calls.
+accuracy. Offline fixture and evaluator tests run with
+`python -m pytest tests\test_evals.py tests\test_eval_triage.py` without API calls.
+
+## Lessons learned
+
+- **Valid structure is not the same as correct analysis.** The example run
+  extracted key fields well but confused several categories. Evaluate semantic
+  accuracy separately from schema validation.
+- **Failures must stay in the denominator.** Missing or failed results fail
+  every scored check instead of making the model look more accurate.
+- **Concurrency and request rate are different controls.** `--jobs` limits
+  in-flight work; `--request-interval` spaces request starts, including retries.
+- **Console output and JSON need separate channels.** Batch status and summaries
+  go to stderr so the evaluator can capture a single clean JSON document.
+- **Local models need an explicit contract too.** Select an installed model
+  with `--model`; unsupported structured output fails explicitly rather than
+  silently switching providers or accepting free-form text.
 
 ## 🛠️ Roadmap
 
 See the [Issues](https://github.com/wiertmir/llm-inbox-triage/issues) tab. MVP first, enhancements later.
 
 **MVP:**
-- [ ] Read text from file / stdin
-- [ ] **Structured Outputs**: Pydantic `TriageAnalysis` via `responses.parse` (OpenAI) — schema guaranteed, no `json.loads`
-- [ ] Works on OpenAI and Anthropic (`--provider` flag)
-- [ ] Pretty terminal output + JSON export
-- [ ] **Mini-eval**: 10–20 sample messages with expected output, measure categorization accuracy
-- [ ] README with example + lessons learned + eval results
+- [x] Read text from file / stdin
+- [x] **Structured Outputs**: Pydantic `TriageAnalysis` via `responses.parse` (OpenAI)
+- [x] Works on OpenAI and Anthropic (`--provider` flag)
+- [x] Pretty terminal output + JSON export
+- [x] **Mini-eval**: 20 labeled samples and category/key-field accuracy reporting (#8)
+- [x] README with examples, screenshots, lessons learned, and an illustrative eval run
 
 **Later:**
 - [x] Model-selected Google/Me Calendar events from a single triage with `--create-events`
 - [x] Batch mode with throttled concurrency, per-file status, and aggregate JSON (#7)
-- [ ] Refusal / safety handling surfaced cleanly
+- [x] Model overrides and local Ollama support in both CLIs
+- [x] Refusal handling surfaced as explicit errors
 
 ## 📝 License
 

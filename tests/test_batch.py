@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from rich.console import Console
+from rich.progress import Progress
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_none
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -221,6 +222,56 @@ def test_batch_bounds_concurrency_and_preserves_filename_order(batch, monkeypatc
     assert [item["id"] for item in report["results"]] == [f"{i}.txt" for i in range(7)]
     if jobs > 1:
         assert completed[0] != "0"
+
+
+@pytest.mark.parametrize("count,jobs,failures", [(5, 3, False), (20, 3, False), (20, 20, True)])
+def test_batch_initially_shows_fifteen_rows_and_reveals_one_per_completion(
+    batch, monkeypatch, count, jobs, failures,
+):
+    files = []
+    for i in range(count):
+        path = batch / f"{i:02}.txt"
+        path.write_text(str(i), encoding="utf-8")
+        files.append(path)
+    monkeypatch.setattr(
+        sys, "argv", ["triage.py", "--batch", str(batch), "--jobs", str(jobs)],
+    )
+    _, args = triage.parse_arguments()
+    progress = Progress(console=Console(file=io.StringIO()), auto_refresh=False)
+    first_visibility = []
+    reveals = []
+    completed = []
+    original_update = progress.update
+
+    def update(task, **kwargs):
+        original_update(task, **kwargs)
+        if kwargs.get("completed") == 1:
+            completed.append(task)
+        if kwargs.get("visible") is True:
+            reveals.append((
+                len(completed), sum(task.visible for task in progress.tasks),
+            ))
+
+    async def fake_triage(text):
+        if not first_visibility:
+            first_visibility.append(sum(task.visible for task in progress.tasks))
+        await asyncio.sleep(0)
+        if failures and int(text) % 2:
+            raise triage.TriageRefusal("Synthetic refusal")
+        return analysis()
+
+    monkeypatch.setattr(progress, "update", update)
+    provider = triage.Provider(fake_triage, "test", "test", "TEST_KEY")
+
+    report = asyncio.run(triage.process_batch(files, args, provider, progress))
+
+    initial = min(15, count)
+    assert first_visibility == [initial]
+    assert reveals == [(i, initial + i) for i in range(1, count - initial + 1)]
+    assert len(completed) == count
+    assert all(task.visible and task.finished for task in progress.tasks)
+    assert len(report.results) + len(report.errors) == count
+    assert len(report.errors) == (count // 2 if failures else 0)
 
 
 def test_request_throttle_spaces_starts_including_retries_and_closes_clients(monkeypatch):

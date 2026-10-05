@@ -294,6 +294,15 @@ def test_passes_triage_result_as_text_format(fake_openai):
     assert single_parse_call(fake_openai)["text_format"] is triage.TriageAnalysis
 
 
+def test_selected_model_override_reaches_openai(fake_openai):
+    provider = triage.select_provider("openai", model="gpt-custom")
+
+    asyncio.run(provider.triage("hello"))
+
+    assert provider.model == "gpt-custom"
+    assert single_parse_call(fake_openai)["model"] == "gpt-custom"
+
+
 def test_passes_a_model_name(fake_openai):
     asyncio.run(triage.triage_openai("hello"))
 

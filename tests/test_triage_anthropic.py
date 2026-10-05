@@ -172,6 +172,15 @@ def single_call(fake):
     return calls[0]
 
 
+def test_selected_model_override_reaches_anthropic(fake_anthropic):
+    provider = triage.select_provider("anthropic", model="claude-custom")
+
+    asyncio.run(provider.triage("hello"))
+
+    assert provider.model == "claude-custom"
+    assert single_call(fake_anthropic)[1]["model"] == "claude-custom"
+
+
 def as_text(value) -> str:
     """`system` and message `content` may be a string or a list of text blocks."""
     if isinstance(value, str):
