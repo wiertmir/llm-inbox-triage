@@ -35,6 +35,15 @@ is closed after its request/retry sequence.
 
 All filenames have their own simultaneous status line (queued, waiting for AI,
 done, or failed), followed by a counts-per-category summary on **stderr**.
+The summary uses category colors and icons (plain labels on legacy encodings),
+highlights failures, and includes
+per-category and overall counts for **Dates**, **Amounts**, and **Reply needed**.
+Each signal counts successful messages, not individual extracted values:
+dates include deadlines, amounts count nonempty extracted amount lists, and
+reply needed means a nonblank `suggested_reply`. Failed files have unknown
+signals (shown as `-`) and are excluded from signal totals.
+Without `--json`, batch mode prints no individual triage cards; its console
+output is limited to status lines and the summary table (plus any error messages).
 These remain visible with `--json`; stdout contains only one JSON document.
 For redirected/noninteractive stderr, Rich prints the final status rows.
 Successful results and errors are ordered by filename, not completion time.

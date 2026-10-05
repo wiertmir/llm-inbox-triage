@@ -1122,14 +1122,52 @@ async def process_batch(
     )
 
 
+def batch_signal_counts(results: list[TriageResult]) -> tuple[int, int, int]:
+    return (
+        sum(bool(result.extracted.dates or result.extracted.deadlines) for result in results),
+        sum(bool(result.extracted.amounts) for result in results),
+        sum(bool(result.suggested_reply and result.suggested_reply.strip()) for result in results),
+    )
+
+
 def print_batch_summary(report: BatchReport, console: Console) -> None:
-    table = Table(title="Batch summary")
+    results = [item.result for item in report.results]
+    succeeded, failed = len(results), len(report.errors)
+    total = succeeded + failed
+    table = Table(
+        title="[bold cyan]Batch summary[/bold cyan]", title_justify="left",
+        box=box.ROUNDED, border_style="cyan", header_style="bold cyan",
+        caption=(
+            f"{succeeded} successful | {failed} failed | {total} {'file' if total == 1 else 'files'}\n"
+            "Signals count successful messages, not individual values."
+        ),
+        caption_justify="left",
+    )
     table.add_column("Category")
     table.add_column("Count", justify="right")
+    table.add_column("Dates", justify="right", style="cyan")
+    table.add_column("Amounts", justify="right", style="yellow")
+    table.add_column("Reply needed", justify="right", style="green")
     for category in Category:
-        count = sum(item.result.category == category for item in report.results)
-        table.add_row(category.value, str(count))
-    table.add_row("Failed", str(len(report.errors)))
+        matching = [result for result in results if result.category == category]
+        emoji, colour = CATEGORY_STYLE[category]
+        try:
+            emoji.encode(console.encoding)
+        except UnicodeEncodeError:
+            label = category.value
+        else:
+            label = f"{emoji} {category.value}"
+        table.add_row(
+            Text(label, style=colour), str(len(matching)),
+            *(str(count) for count in batch_signal_counts(matching)),
+            style="" if matching else "dim",
+        )
+    table.add_section()
+    table.add_row(
+        "Total", str(succeeded), *(str(count) for count in batch_signal_counts(results)),
+        style="bold",
+    )
+    table.add_row("Failed", str(failed), "-", "-", "-", style="bold red" if failed else "dim")
     console.print(table)
 
 
@@ -1152,9 +1190,6 @@ def run_batch(args: CliOptions, console: Console) -> int:
         raise CliError(f"Cannot write {out_path}: {exc}{guidance}") from exc
     if args.json:
         print(output_json(report))
-    else:
-        for item in report.results:
-            render(item.result)
     return 1 if report.errors else 0
 
 

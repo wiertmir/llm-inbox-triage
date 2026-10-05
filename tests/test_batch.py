@@ -3,11 +3,14 @@
 import asyncio
 import io
 import json
+import re
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from rich.console import Console
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_none
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -70,12 +73,23 @@ def test_batch_outputs_one_json_and_saves_one_file(batch, monkeypatch, capsys, p
 
 def test_batch_default_output_is_saved_without_json(batch, monkeypatch, capsys):
     (batch / "a.txt").write_text("first", encoding="utf-8")
+    (batch / "b.txt").write_text("second", encoding="utf-8")
+
+    def unexpected_render(*args, **kwargs):
+        raise AssertionError("Batch mode must not render individual triage cards")
+
+    monkeypatch.setattr(triage, "render", unexpected_render)
 
     assert run_main(monkeypatch, batch) == 0
 
     saved = batch.parent / "out" / "messages.out.json"
-    assert json.loads(saved.read_text(encoding="utf-8"))["results"][0]["id"] == "a.txt"
-    assert "Batch summary" in capsys.readouterr().err
+    report = json.loads(saved.read_text(encoding="utf-8"))
+    assert [item["id"] for item in report["results"]] == ["a.txt", "b.txt"]
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "Batch summary" in err
+    assert re.search(r"question[^\n]*\b2\b", err)
+    assert "Inbox Triage" not in err
 
 
 @pytest.mark.parametrize("json_mode", [False, True])
@@ -421,3 +435,82 @@ def test_batch_workers_use_shared_request_throttle(batch, monkeypatch, capsys):
     assert all(throttle is throttles[0] for throttle in throttles)
     assert throttles[0] is not None
     assert triage._request_throttle.get() is None
+
+
+def test_batch_summary_counts_messages_with_signals_per_category_and_overall():
+    def result(id, category, extracted, reply=None):
+        return triage.TriageResult(
+            id=id, category=category, priority=2, summary="Summary.",
+            extracted=extracted, suggested_reply=reply,
+        )
+
+    report = triage.BatchReport(
+        results=[
+            triage.BatchItem(result(
+                "a.txt", triage.Category.invoice,
+                triage.Extracted(
+                    dates=[date(2026, 11, 1), date(2026, 11, 2)],
+                    deadlines=[date(2026, 11, 2)],
+                    amounts=[
+                        triage.Money(amount=100, currency="USD"),
+                        triage.Money(amount=200, currency="EUR"),
+                    ],
+                ),
+                "I will arrange payment.",
+            )),
+            triage.BatchItem(result(
+                "b.txt", triage.Category.invoice,
+                triage.Extracted(deadlines=[date(2026, 11, 3)]), " \n\t ",
+            )),
+            triage.BatchItem(result(
+                "c.txt", triage.Category.question,
+                triage.Extracted(amounts=[triage.Money(amount=0, currency="JPY")]),
+                "Here are the instructions.",
+            )),
+            triage.BatchItem(result("d.txt", triage.Category.ignore, triage.Extracted())),
+            triage.BatchItem(result("e.txt", triage.Category.question, triage.Extracted(), "")),
+        ],
+        errors=[triage.BatchError("failed.txt", "Cannot read")],
+    )
+    output = io.StringIO()
+    console = Console(file=output, width=100, color_system=None)
+
+    triage.print_batch_summary(report, console)
+
+    rendered = output.getvalue()
+    assert all(heading in rendered for heading in ["Count", "Dates", "Amounts", "Reply needed"])
+    assert re.search(r"invoice\W+2\W+2\W+1\W+1", rendered)
+    assert re.search(r"question\W+2\W+0\W+1\W+1", rendered)
+    assert re.search(r"ignore\W+1\W+0\W+0\W+0", rendered)
+    assert re.search(r"Total\W+5\W+2\W+2\W+2", rendered)
+    assert re.search(r"Failed\W+1\W+-\W+-\W+-", rendered)
+    assert "5 successful | 1 failed | 6 files" in rendered
+    assert "not individual values" in rendered
+
+
+def test_all_failed_batch_summary_shows_zero_signals():
+    report = triage.BatchReport([], [triage.BatchError("failed.txt", "Cannot read")])
+    output = io.StringIO()
+
+    triage.print_batch_summary(report, Console(file=output, width=100, color_system=None))
+
+    rendered = output.getvalue()
+    assert re.search(r"Total\W+0\W+0\W+0\W+0", rendered)
+    assert "0 successful | 1 failed | 1 file" in rendered
+
+
+def test_batch_summary_supports_legacy_windows_encoding():
+    buffer = io.BytesIO()
+    output = io.TextIOWrapper(buffer, encoding="cp1252")
+    report = triage.BatchReport([], [triage.BatchError("failed.txt", "Cannot read")])
+
+    triage.print_batch_summary(
+        report, Console(file=output, width=100, color_system=None, force_terminal=False),
+    )
+    output.flush()
+
+    rendered = buffer.getvalue().decode("cp1252")
+    assert "Batch summary" in rendered
+    assert "invoice" in rendered
+    assert "Reply needed" in rendered
+    assert "0 successful | 1 failed | 1 file" in rendered
