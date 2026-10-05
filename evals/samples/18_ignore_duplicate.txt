@@ -1,0 +1,4 @@
+Subject: Duplicate notification - ignore
+
+This is a duplicate of a notification you have already handled.
+It adds no new information. Please ignore it; no further action is required.

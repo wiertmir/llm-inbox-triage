@@ -468,6 +468,7 @@ def test_me_limits_are_validated_for_entire_batch_before_writes(monkeypatch):
     write = Mock(side_effect=AssertionError("Must not write an invalid batch"))
     monkeypatch.setattr(triage, "create_calendar_entry", write)
     result = triage.TriageResult(
+        id="sample.txt",
         category=triage.Category.other, priority=2, summary="Two deadlines",
         extracted=triage.Extracted(deadlines=[date(2026, 10, 5)]),
         proposed_events=[
@@ -512,6 +513,7 @@ def test_failed_creation_reports_422_as_not_created(monkeypatch, partial_success
     outcomes = [{"id": "first-event"}, rejection] if partial_success else [rejection]
     monkeypatch.setattr(triage, "create_me_calendar_entry", Mock(side_effect=outcomes))
     result = triage.TriageResult(
+        id="sample.txt",
         category=triage.Category.other, priority=2, summary="Deadlines",
         extracted=triage.Extracted(deadlines=[date(2026, 10, 5)]),
         proposed_events=[
@@ -580,6 +582,7 @@ def test_me_batch_reuses_token_and_exports_event_ids(config, store, monkeypatch)
         store.get_password, "return_value", saved
     )
     result = triage.TriageResult(
+        id="sample.txt",
         category=triage.Category.other, priority=2, summary="Two deadlines",
         extracted=triage.Extracted(deadlines=[date(2026, 10, 5)]),
         proposed_events=[
@@ -612,6 +615,7 @@ def test_cli_me_is_typed_and_uses_correct_status(monkeypatch, capsys):
 
     async def first_triage(text):
         return triage.TriageResult(
+            id="***stdin***",
             category=triage.Category.other, priority=2, summary="Deadline",
             extracted=triage.Extracted(deadlines=[date(2026, 10, 5)]),
             proposed_events=[triage.CalendarEvent(

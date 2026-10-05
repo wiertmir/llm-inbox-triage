@@ -1,0 +1,5 @@
+Subject: Automated test message - discard
+
+This is an automatically generated delivery test. It contains no real
+request, incident, invoice, or useful update. Please ignore this message;
+no reply or other action is needed.

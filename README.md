@@ -9,6 +9,83 @@ python triage.py sample.txt
 python triage.py sample.txt --provider anthropic
 ```
 
+### Batch processing (#7)
+
+Use `--batch <dir>` to process every `.txt` file directly in a directory
+(case-insensitive extension; subdirectories and other file types are skipped):
+
+```powershell
+python triage.py --batch .\messages
+python triage.py --batch .\evals\samples --json
+python triage.py --batch .\messages --provider anthropic --jobs 2 --request-interval 2
+python triage.py --batch .\messages --json --out .\reports\messages.json
+```
+
+`--batch` requires a directory argument and cannot be combined with the positional
+input `path`, in either order. Without `--batch`, file input works as before;
+omitting both `path` and `--batch` reads stdin.
+
+Batch processing defaults to **3 concurrent workers** and **at least 1 second
+between AI request starts**, including retries. `--jobs` accepts a positive
+integer and `--request-interval` a finite positive number of seconds; both
+options require `--batch`. Transient errors retain the existing exponential
+backoff and bounded `Retry-After` handling. These are request-rate controls,
+not token quotas: tune them for your provider/model's limits. Each SDK client
+is closed after its request/retry sequence.
+
+All filenames have their own simultaneous status line (queued, waiting for AI,
+done, or failed), followed by a counts-per-category summary on **stderr**.
+These remain visible with `--json`; stdout contains only one JSON document.
+For redirected/noninteractive stderr, Rich prints the final status rows.
+Successful results and errors are ordered by filename, not completion time.
+
+Batch mode always saves **one aggregate JSON**, by default to
+`out/<directory-name>.out.json`; existing output is overwritten. `--out PATH`
+overrides the destination and may be used without `--json` in batch mode.
+`--json` additionally prints the same document to stdout. This intentionally
+replaces issue #7's one-JSON-per-input output:
+
+```json
+{
+  "results": [
+    {
+      "id": "message.txt",
+      "category": "question",
+      "priority": 2,
+      "summary": "A question about exporting records.",
+      "suggested_reply": null,
+      "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []},
+      "proposed_events": []
+    }
+  ],
+  "errors": [
+    {"id": "unreadable.txt", "error": "Cannot read unreadable.txt: Access denied"}
+  ]
+}
+```
+
+An unreadable/empty message, API failure, or calendar failure is recorded in
+`errors` and does not stop other files. Any per-file failure makes the command
+exit with code **1**; all-success batches exit **0**. Invalid or empty directories
+fail explicitly before any requests. An output-file write failure also exits 1;
+with `--json`, the aggregate remains available on stdout. Interruption exits 130
+and does not write a partial aggregate.
+
+`--create-events` also works in batch mode. AI analysis is concurrent but calendar
+authorization/writes are serialized. Each successful result includes its own
+`calendar_events` list when enabled. Calendar writes are not retried; an error
+may leave events already created. Check your calendar before rerunning. Deduplication
+is per input message, not across messages or separate runs.
+
+### Result IDs
+
+Every exported `TriageResult` now requires `id: str`. For file input this is the
+filename, **including its extension**, not a full path. For stdin it is the
+literal `***stdin***`. IDs are assigned by the application, never by the model.
+The provider functions return a validated `TriageAnalysis`; the CLI adds the
+source ID to create the final `TriageResult`. Callers constructing or loading
+older `TriageResult` objects must supply the source ID themselves.
+
 `create_calendar_entry(calendar, title, start, end, description="", access_token=None)`
 is also available for callers that want to create an event in Google, Me, or
 Hotmail/Outlook Calendar. Use the `Calendar` enum (`Calendar.google`, `Calendar.me`,
@@ -52,7 +129,8 @@ With `--create-events --json`, stdout and `--out` include an additional
 `end`, `description`, and `url`. Without `--create-events`, the JSON shape is
 unchanged apart from the new `proposed_events` field. No proposals means no
 calendar authorization or calendar requests. Older saved triage results without
-`proposed_events` remain readable and default to an empty list.
+`proposed_events` default to an empty list; when loading them as `TriageResult`,
+supply the newly required source `id` as described above.
 
 Identical proposals are deduplicated within a run, but separate runs
 can create duplicates. Calendar writes are not automatically retried because
@@ -181,6 +259,7 @@ Given raw text, it returns:
 
 | Field | Description |
 |-------|-------------|
+| `id` | input filename including extension, or `***stdin***` |
 | `category` | e.g. urgent / invoice / spam / question / ignore |
 | `priority` | 1 (low) – 5 (critical) |
 | `summary` | one-sentence summary |
@@ -222,13 +301,46 @@ export ANTHROPIC_API_KEY=sk-ant-...
 python triage.py sample.txt
 ```
 
+## Evaluation samples (issue #8 preparation)
+
+[evals/samples](evals/samples) contains 20 synthetic messages, separate from
+the original `sample.txt`. [evals/expected.json](evals/expected.json) labels
+each message with its expected category and all four extracted fields:
+`dates`, `amounts`, `names`, and `deadlines`.
+
+The dataset covers every category: three samples each for `urgent`, `invoice`,
+`spam`, `question`, `newsletter`, and `ignore`, plus two for `other`. It includes
+empty fields, multiple amounts, JPY/USD/EUR amounts, the default JPY currency,
+deadlines, and a relative deadline anchored to an explicit sent date. All
+messages and entities are fictional; no real inbox data is included.
+
+The manifest has `schema_version: 1` and a `samples` array. Each entry contains
+a unique `id`, a `file` path relative to the manifest, and an `expected` object.
+For a future runner, compare categories exactly and extracted lists as unordered
+sets of values, including empty lists (unexpected extra values are mismatches).
+Dates use ISO `YYYY-MM-DD`; money values pair a numeric amount with an ISO currency
+code. Names retain their spelling and capitalization. Summaries, priorities,
+reply drafts, and calendar proposals are intentionally not labeled or scored.
+
+You can try a single sample with:
+
+```powershell
+python triage.py .\evals\samples\04_invoice_jpy.txt --json
+```
+
+These are hand-authored expected labels, not recorded model outputs or measured
+accuracy. The evaluation runner and accuracy reporting from issue #8 are not
+implemented yet. Batch results can be matched to labels using each manifest
+entry's input filename, rather than its extensionless fixture `id`. Offline fixture
+integrity checks run with `python -m pytest tests\test_evals.py` without API calls.
+
 ## 🛠️ Roadmap
 
 See the [Issues](https://github.com/wiertmir/llm-inbox-triage/issues) tab. MVP first, enhancements later.
 
 **MVP:**
 - [ ] Read text from file / stdin
-- [ ] **Structured Outputs**: Pydantic `TriageResult` via `responses.parse` (OpenAI) — schema guaranteed, no `json.loads`
+- [ ] **Structured Outputs**: Pydantic `TriageAnalysis` via `responses.parse` (OpenAI) — schema guaranteed, no `json.loads`
 - [ ] Works on OpenAI and Anthropic (`--provider` flag)
 - [ ] Pretty terminal output + JSON export
 - [ ] **Mini-eval**: 10–20 sample messages with expected output, measure categorization accuracy
@@ -236,7 +348,7 @@ See the [Issues](https://github.com/wiertmir/llm-inbox-triage/issues) tab. MVP f
 
 **Later:**
 - [x] Model-selected Google/Me Calendar events from a single triage with `--create-events`
-- [ ] Batch mode (process a folder of messages)
+- [x] Batch mode with throttled concurrency, per-file status, and aggregate JSON (#7)
 - [ ] Refusal / safety handling surfaced cleanly
 
 ## 📝 License

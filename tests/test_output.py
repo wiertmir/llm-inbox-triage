@@ -26,6 +26,7 @@ import triage  # noqa: E402
 
 def make_result(**overrides) -> triage.TriageResult:
     data: dict[str, Any] = dict(
+        id="sample.txt",
         category=triage.Category.invoice,
         priority=3,
         summary="Invoice #4471 for 128,000 JPY is due on August 31, 2026.",

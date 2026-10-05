@@ -247,6 +247,7 @@ def test_main_accepts_calendar_selector(monkeypatch, capsys):
     async def fake_triage(text):
         assert text == "message"
         return triage.TriageResult(
+            id="***stdin***",
             category=triage.Category.other,
             priority=1,
             summary="Done",

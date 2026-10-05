@@ -8,9 +8,10 @@ category, priority, summary, suggested reply, and extracted data.
 >>> KEY 2026 IDEA <<<
 We do NOT ask the model for "STRICT JSON and nothing else" and then json.loads()
 the raw text (that's the old, fragile pattern). Instead we use STRUCTURED OUTPUTS:
-define the shape as a Pydantic model and let the API GUARANTEE the schema.
-  - OpenAI:    await client.responses.parse(..., text_format=TriageResult) -> .output_parsed
-  - Anthropic: await client.messages.parse(..., output_format=TriageResult) -> .parsed_output
+define the analysis shape as a Pydantic model and let the API GUARANTEE the schema.
+  - OpenAI:    await client.responses.parse(..., text_format=TriageAnalysis) -> .output_parsed
+  - Anthropic: await client.messages.parse(..., output_format=TriageAnalysis) -> .parsed_output
+The application adds the required input ID to produce a TriageResult.
 Both providers use the async SDK clients (AsyncOpenAI / AsyncAnthropic).
 Transient API errors (rate limit, timeout, overload, 5xx) are retried with
 exponential backoff via tenacity (honouring the server's Retry-After hint);
@@ -25,15 +26,18 @@ Usage:
     python triage.py sample.txt --json --out       # JSON to stdout and out/sample.out.json
     python triage.py sample.txt --json -o res.json # JSON to stdout and res.json
     python triage.py sample.txt --create-events   # Model-selected Google Calendar entries
+    python triage.py --batch evals\\samples --json # One aggregate report, also saved to out/
 """
 
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import time
 from dataclasses import dataclass
+from contextvars import ContextVar
 from enum import Enum
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -49,6 +53,7 @@ from rich.padding import Padding
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from pydantic.config import JsonDict
@@ -130,7 +135,7 @@ class Extracted(BaseModel):
     )
 
 
-class TriageResult(BaseModel):
+class TriageAnalysis(BaseModel):
     category: Category
     priority: int = Field(ge=1, le=5, description="1 = trivial, 5 = drop-everything")
     summary: str = Field(description="One sentence.")
@@ -144,13 +149,18 @@ class TriageResult(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_proposed_events(self) -> "TriageResult":
+    def validate_proposed_events(self) -> "TriageAnalysis":
         dates = set(self.extracted.dates) | set(self.extracted.deadlines)
         for event in self.proposed_events:
             start_date = event.start.date() if isinstance(event.start, datetime) else event.start
             if start_date not in dates:
                 raise ValueError("Proposed event start must belong to extracted dates/deadlines")
         return self
+
+
+class TriageResult(TriageAnalysis):
+    id: str = Field(description="Input filename, including extension, or ***stdin*** for stdin")
+
 
 class TriageRefusal(Exception):
     """The model declined or produced no structured output."""
@@ -344,7 +354,7 @@ def read_input(path: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. PROVIDERS  (both return a validated TriageResult, not a raw dict)
+# 3. PROVIDERS  (both return a validated analysis, not a raw dict)
 # ---------------------------------------------------------------------------
 
 def _is_transient(exc: BaseException) -> bool:
@@ -418,13 +428,39 @@ def _retrying(provider: str) -> AsyncRetrying:
 T = TypeVar("T")
 
 
-async def _with_retry(provider: str, call: Callable[[], Awaitable[T]]) -> T:
+class RequestThrottle:
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self.lock = asyncio.Lock()
+        self.next_start = 0.0
+
+    async def wait(self) -> None:
+        async with self.lock:
+            delay = self.next_start - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self.next_start = time.monotonic() + self.interval
+
+
+_request_throttle: ContextVar[RequestThrottle | None] = ContextVar("request_throttle", default=None)
+
+
+async def _with_retry(
+    provider: str, call: Callable[[], Awaitable[T]],
+    close: Callable[[], Awaitable[None]] | None = None,
+) -> T:
     """Await call(), retrying transient errors; the last error is re-raised."""
-    async for attempt in _retrying(provider):
-        with attempt:
-            return await call()
-    # Unreachable: with reraise=True tenacity either returns above or raises.
-    raise AssertionError("retry loop ended without a result")
+    try:
+        async for attempt in _retrying(provider):
+            with attempt:
+                throttle = _request_throttle.get()
+                if throttle is not None:
+                    await throttle.wait()
+                return await call()
+        raise AssertionError("retry loop ended without a result")
+    finally:
+        if close is not None:
+            await close()
 
 
 def _require_key(*env_names: str) -> None:
@@ -435,7 +471,7 @@ def _require_key(*env_names: str) -> None:
         )
 
 
-def _refusal_text(response: ParsedResponse[TriageResult]) -> str | None:
+def _refusal_text(response: ParsedResponse[TriageAnalysis]) -> str | None:
     for output in response.output:
         if output.type != "message":
             continue
@@ -446,8 +482,8 @@ def _refusal_text(response: ParsedResponse[TriageResult]) -> str | None:
 
     return None
 
-async def triage_openai(text: str) -> TriageResult:
-    """Call OpenAI with Structured Outputs and return a validated TriageResult."""
+async def triage_openai(text: str) -> TriageAnalysis:
+    """Call OpenAI with Structured Outputs; the application supplies the result ID."""
     logger.info("Using OpenAI provider")
     _require_key(OPENAI_KEY_ENV)
     # Retries are ours (see _retrying), so switch off the SDK's built-in ones.
@@ -465,8 +501,9 @@ async def triage_openai(text: str) -> TriageResult:
         lambda: client.responses.parse(
             model=OPENAI_MODEL,
             input=messages,
-            text_format=TriageResult
+            text_format=TriageAnalysis
         ),
+        close=client.close,
     )
 
     parsed = response.output_parsed
@@ -482,8 +519,8 @@ async def triage_openai(text: str) -> TriageResult:
     return parsed
 
 
-async def triage_anthropic(text: str) -> TriageResult:
-    """Call Anthropic and return a validated TriageResult.
+async def triage_anthropic(text: str) -> TriageAnalysis:
+    """Call Anthropic and return a validated TriageAnalysis.
     """
     logger.info("Using Anthropic provider")
     _require_key(ANTHROPIC_KEY_ENV, "ANTHROPIC_AUTH_TOKEN")
@@ -504,8 +541,9 @@ async def triage_anthropic(text: str) -> TriageResult:
             system=SYSTEM_PROMPT,
             max_tokens=ANTHROPIC_MAX_TOKENS,
             messages=messages,
-            output_format=TriageResult
+            output_format=TriageAnalysis
         ),
+        close=client.close,
     )
 
     if response.stop_reason == "refusal":
@@ -525,7 +563,7 @@ async def triage_anthropic(text: str) -> TriageResult:
 
 
 async def create_events(
-    result: TriageResult, calendar: Calendar | str = Calendar.google,
+    result: TriageAnalysis, calendar: Calendar | str = Calendar.google,
 ) -> list[CreatedCalendarEvent]:
     """Create the first triage's proposals without any additional LLM requests."""
     try:
@@ -535,7 +573,7 @@ async def create_events(
     if calendar not in (Calendar.google, Calendar.me):
         raise CalendarToolError("Automatic event creation supports only Google Calendar or Me Calendar")
     try:
-        validated = TriageResult.model_validate(result.model_dump())
+        validated = TriageAnalysis.model_validate(result.model_dump())
     except ValidationError as exc:
         raise CalendarToolError("Invalid calendar proposals in the triage result; no events created") from exc
     if calendar == Calendar.me:
@@ -656,7 +694,10 @@ def render(result: TriageResult, console: Console | None = None) -> None:
         _priority_meter(result.priority),
     )
 
-    parts: list = [header, Padding(Text(result.summary, style="italic"), (1, 0, 0, 0))]
+    parts: list = [
+        header, Text(f"Input: {result.id}", style="dim"),
+        Padding(Text(result.summary, style="italic"), (1, 0, 0, 0)),
+    ]
 
     table = _extracted_table(result.extracted)
     if table is not None:
@@ -709,17 +750,49 @@ def default_out_path(input_path: str | None) -> Path:
     return OUT_DIR / f"{stem}.out.json"
 
 
-def output_json(
+@dataclass
+class BatchItem:
+    result: TriageResult
+    calendar_events: list[CreatedCalendarEvent] | None = None
+
+
+@dataclass
+class BatchError:
+    id: str
+    error: str
+
+
+@dataclass
+class BatchReport:
+    results: list[BatchItem]
+    errors: list[BatchError]
+
+
+def result_data(
     result: TriageResult, calendar_events: list[CreatedCalendarEvent] | None = None,
-) -> str:
+) -> dict[str, Any]:
     data = result.model_dump(mode="json")
     if calendar_events is not None:
         data["calendar_events"] = [event.model_dump(mode="json") for event in calendar_events]
+    return data
+
+
+def output_json(
+    result: TriageResult | BatchReport,
+    calendar_events: list[CreatedCalendarEvent] | None = None,
+) -> str:
+    if isinstance(result, BatchReport):
+        data = {
+            "results": [result_data(item.result, item.calendar_events) for item in result.results],
+            "errors": [{"id": error.id, "error": error.error} for error in result.errors],
+        }
+    else:
+        data = result_data(result, calendar_events)
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 def write_output(
-    result: TriageResult, path: Path,
+    result: TriageResult | BatchReport, path: Path,
     calendar_events: list[CreatedCalendarEvent] | None = None,
 ) -> None:
     """Save the result as JSON, creating parent folders as needed."""
@@ -740,6 +813,9 @@ def write_output(
 
 class CliOptions(argparse.Namespace):
     path: str | None
+    batch: str | None
+    jobs: int
+    request_interval: float
     provider: str
     calendar: Calendar
     create_events: bool
@@ -753,15 +829,49 @@ class CliError(Exception):
 
 @dataclass(frozen=True)
 class Provider:
-    triage: Callable[[str], Awaitable[TriageResult]]
+    triage: Callable[[str], Awaitable[TriageAnalysis]]
     name: str
     model: str
     key_env: str
 
 
+def positive_jobs(value: str) -> int:
+    try:
+        jobs = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return jobs
+
+
+def positive_interval(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite positive number of seconds") from exc
+    if not math.isfinite(interval) or interval <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number of seconds")
+    return interval
+
+
 def parse_arguments() -> tuple[argparse.ArgumentParser, CliOptions]:
     parser = argparse.ArgumentParser(description="LLM inbox triage")
-    parser.add_argument("path", nargs="?", help="Text file to triage (default: stdin)")
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument("path", nargs="?", help="Text file to triage (default: stdin)")
+    input_group.add_argument(
+        "--batch",
+        metavar="DIR",
+        help="Triage every .txt file directly in DIR (cannot be used with path)",
+    )
+    parser.add_argument(
+        "--jobs", type=positive_jobs,
+        help="Maximum concurrent batch requests (default: 3; requires --batch)",
+    )
+    parser.add_argument(
+        "--request-interval", type=positive_interval, metavar="SECONDS",
+        help="Minimum time between batch AI request starts, including retries (default: 1)",
+    )
     parser.add_argument(
         "--provider",
         choices=["openai", "anthropic"],
@@ -787,11 +897,15 @@ def parse_arguments() -> tuple[argparse.ArgumentParser, CliOptions]:
         nargs="?",
         const="",
         metavar="PATH",
-        help="With --json, also save the result to PATH (default: out/<input name>.out.json)",
+        help="Save JSON to PATH (--json required except in batch; default: out/<input name>.out.json)",
     )
     args = CliOptions()
     parser.parse_args(namespace=args)
-    if args.out is not None and not args.json:
+    if args.batch is None and (args.jobs is not None or args.request_interval is not None):
+        parser.error("--jobs and --request-interval require --batch")
+    args.jobs = args.jobs if args.jobs is not None else 3
+    args.request_interval = args.request_interval if args.request_interval is not None else 1.0
+    if args.out is not None and not args.json and args.batch is None:
         parser.error("--out requires --json")
     # "--out sample.txt" would take the input file as the output path and
     # overwrite it, so insist on a .json output name.
@@ -846,17 +960,9 @@ def select_provider(name: str) -> Provider:
     raise CliError(f"Unknown LLM provider: {name}")
 
 
-def run_triage(text: str, provider: Provider, console: Console) -> TriageResult:
-    # Spinner and timing go to stderr, and are silenced entirely with --json
-    # so the output can be part of a pipeline.
-    status_text = (
-        f"[bold]📨 Triaging message[/bold] ({len(text):,} chars) · "
-        f"waiting for [cyan]{provider.model}[/cyan] on {provider.name}…"
-    )
-    started = time.perf_counter()
+async def analyze_message(text: str, provider: Provider) -> TriageAnalysis:
     try:
-        with console.status(status_text, spinner="dots"):
-            result = asyncio.run(provider.triage(text))
+        return await provider.triage(text)
     except (openai.AuthenticationError, anthropic.AuthenticationError) as exc:
         raise CliError(
             f"{provider.name} rejected the API key - check {provider.key_env}: {_describe_error(exc)}"
@@ -875,6 +981,25 @@ def run_triage(text: str, provider: Provider, console: Console) -> TriageResult:
         raise CliError(
             f"{provider.name} returned malformed output that does not match TriageResult"
         ) from exc
+
+
+def identified_result(analysis: TriageAnalysis, source: str | None) -> TriageResult:
+    return TriageResult(
+        **analysis.model_dump(exclude={"id"}),
+        id=Path(source).name if source is not None else "***stdin***",
+    )
+
+
+def run_triage(text: str, provider: Provider, console: Console) -> TriageAnalysis:
+    # Spinner and timing go to stderr, and are silenced entirely with --json
+    # so the output can be part of a pipeline.
+    status_text = (
+        f"[bold]📨 Triaging message[/bold] ({len(text):,} chars) · "
+        f"waiting for [cyan]{provider.model}[/cyan] on {provider.name}…"
+    )
+    started = time.perf_counter()
+    with console.status(status_text, spinner="dots"):
+        result = asyncio.run(analyze_message(text, provider))
     elapsed = time.perf_counter() - started
     logger.info("Got response from {model} in {elapsed:.1f}s", model=provider.model, elapsed=elapsed)
     console.print(
@@ -931,21 +1056,129 @@ def print_cli_output(
         render(result)
 
 
+def batch_files(directory: str) -> list[Path]:
+    folder = Path(directory)
+    if not folder.is_dir():
+        raise CliError(f"Batch directory does not exist or is not a directory: {directory}")
+    try:
+        files = sorted(
+            (path for path in folder.iterdir() if path.is_file() and path.suffix.lower() == ".txt"),
+            key=lambda path: path.name,
+        )
+    except OSError as exc:
+        raise CliError(f"Cannot list batch directory {directory}: {exc}") from exc
+    if not files:
+        raise CliError(f"No .txt files found in batch directory: {directory}")
+    return files
+
+
+async def process_batch(
+    files: list[Path], args: CliOptions, provider: Provider, progress: Progress,
+) -> BatchReport:
+    outcomes: dict[Path, BatchItem | BatchError] = {}
+    tasks = {path: progress.add_task(path.name, total=1, state="Queued", start=False) for path in files}
+    pending = iter(files)
+    calendar_lock = asyncio.Lock()
+
+    async def worker() -> None:
+        for path in pending:
+            task = tasks[path]
+            progress.start_task(task)
+            progress.update(task, state="Reading")
+            try:
+                try:
+                    text = read_input(str(path))
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise CliError(f"Cannot read {path.name}: {exc}") from exc
+                if not text.strip():
+                    raise CliError(f"Nothing to triage: {path.name} is empty")
+                progress.update(task, state="Waiting for AI")
+                analysis = await analyze_message(text, provider)
+                result = identified_result(analysis, str(path))
+                events = None
+                if args.create_events:
+                    progress.update(task, state="Creating calendar events")
+                    # OAuth and calendar writes are serialized, not retried.
+                    async with calendar_lock:
+                        events = await create_events(result, args.calendar)
+                outcomes[path] = BatchItem(result, events)
+                progress.update(task, completed=1, state=f"Done ({result.category.value})")
+            except (CliError, TriageRefusal, MissingApiKey, CalendarToolError, CalendarEntryError) as exc:
+                outcomes[path] = BatchError(path.name, str(exc))
+                logger.error("{file}: {error}", file=path.name, error=exc)
+                progress.update(task, completed=1, state="Failed")
+            finally:
+                progress.stop_task(task)
+
+    token = _request_throttle.set(RequestThrottle(args.request_interval))
+    try:
+        await asyncio.gather(*(worker() for _ in range(min(args.jobs, len(files)))))
+    finally:
+        _request_throttle.reset(token)
+    ordered = [outcomes[path] for path in files]
+    return BatchReport(
+        [outcome for outcome in ordered if isinstance(outcome, BatchItem)],
+        [outcome for outcome in ordered if isinstance(outcome, BatchError)],
+    )
+
+
+def print_batch_summary(report: BatchReport, console: Console) -> None:
+    table = Table(title="Batch summary")
+    table.add_column("Category")
+    table.add_column("Count", justify="right")
+    for category in Category:
+        count = sum(item.result.category == category for item in report.results)
+        table.add_row(category.value, str(count))
+    table.add_row("Failed", str(len(report.errors)))
+    console.print(table)
+
+
+def run_batch(args: CliOptions, console: Console) -> int:
+    assert args.batch is not None
+    files = batch_files(args.batch)
+    with Progress(
+        SpinnerColumn(finished_text=""), TextColumn("{task.description}", markup=False),
+        TextColumn("{task.fields[state]}"), TimeElapsedColumn(), console=console,
+    ) as progress:
+        report = asyncio.run(process_batch(files, args, select_provider(args.provider), progress))
+    print_batch_summary(report, console)
+    out_path = Path(args.out) if args.out else OUT_DIR / f"{Path(args.batch).resolve().name}.out.json"
+    try:
+        write_output(report, out_path)
+    except OSError as exc:
+        if args.json:
+            print(output_json(report))
+        guidance = "; check your calendar before rerunning" if args.create_events else ""
+        raise CliError(f"Cannot write {out_path}: {exc}{guidance}") from exc
+    if args.json:
+        print(output_json(report))
+    else:
+        for item in report.results:
+            render(item.result)
+    return 1 if report.errors else 0
+
+
+def run_single(parser: argparse.ArgumentParser, args: CliOptions, console: Console) -> None:
+    text = read_cli_input(parser, args.path)
+    result = identified_result(run_triage(text, select_provider(args.provider), console), args.path)
+    calendar_events = (
+        run_calendar_creation(result, args.calendar, console) if args.create_events else None
+    )
+    save_cli_output(args, result, calendar_events)
+    print_cli_output(result, args.json, calendar_events)
+
+
 def main() -> int:
     parser, args = parse_arguments()
     load_dotenv()
     configure_logging(args.json)
-    console = Console(stderr=True, quiet=args.json)
+    console = Console(stderr=True, quiet=args.json and args.batch is None)
     try:
-        text = read_cli_input(parser, args.path)
-        result = run_triage(text, select_provider(args.provider), console)
-        calendar_events = (
-            run_calendar_creation(result, args.calendar, console) if args.create_events else None
-        )
-        save_cli_output(args, result, calendar_events)
-        print_cli_output(result, args.json, calendar_events)
+        if args.batch is not None:
+            return run_batch(args, console)
+        run_single(parser, args, console)
     except KeyboardInterrupt:
-        logger.warning(
+        (logger.error if args.batch is not None else logger.warning)(
             "Interrupted; check your calendar before rerunning" if args.create_events else "Interrupted"
         )
         return 130

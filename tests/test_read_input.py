@@ -173,6 +173,7 @@ def test_cli_missing_file_exits_cleanly(tmp_path):
 
 def _fake_result():
     return triage.TriageResult(
+        id="***stdin***",
         category=triage.Category.question,
         priority=2,
         summary="stub",
@@ -271,3 +272,96 @@ def test_main_passes_file_text_to_provider(monkeypatch, capsys):
 
     assert triage.main() == 0
     assert "Invoice #4471" in seen["text"]
+
+
+@pytest.mark.parametrize("directory", ["messages", "messages with spaces", ""])
+def test_batch_argument_is_parsed(monkeypatch, directory):
+    monkeypatch.setattr(sys, "argv", ["triage.py", "--batch", directory])
+
+    _, args = triage.parse_arguments()
+
+    assert args.batch == directory
+    assert args.path is None
+
+
+@pytest.mark.parametrize("argv", [[], ["sample.txt"]])
+def test_batch_defaults_to_none(monkeypatch, argv):
+    monkeypatch.setattr(sys, "argv", ["triage.py", *argv])
+
+    _, args = triage.parse_arguments()
+
+    assert args.batch is None
+    assert args.path == (argv[0] if argv else None)
+
+
+@pytest.mark.parametrize("argv", [
+    ["sample.txt", "--batch", "messages"],
+    ["--batch", "messages", "sample.txt"],
+    ["sample.txt", "--batch=messages"],
+    ["--batch=messages", "sample.txt"],
+    ["--batch", "messages", "--", "sample.txt"],
+    ["", "--batch", "messages"],
+    ["--batch", "messages", ""],
+    ["sample.txt", "--batch", ""],
+])
+def test_batch_and_path_are_mutually_exclusive(monkeypatch, capsys, argv):
+    monkeypatch.setattr(sys, "argv", ["triage.py", *argv])
+
+    with pytest.raises(SystemExit) as excinfo:
+        triage.parse_arguments()
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "not allowed with argument" in err
+    assert "--batch" in err and "path" in err
+
+
+def test_batch_requires_directory_argument(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["triage.py", "--batch"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        triage.parse_arguments()
+
+    assert excinfo.value.code == 2
+    assert "argument --batch: expected one argument" in capsys.readouterr().err
+
+
+def test_help_describes_batch_option(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["triage.py", "--help"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        triage.parse_arguments()
+
+    assert excinfo.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--batch DIR" in help_text
+    assert "cannot be used with path" in help_text
+
+
+@pytest.mark.parametrize("directory", ["messages", ""])
+def test_main_dispatches_batch_without_reading_stdin(monkeypatch, directory):
+    seen = []
+
+    def fake_batch(args, console):
+        seen.append(args.batch)
+        return 7
+
+    monkeypatch.setattr(triage, "run_batch", fake_batch)
+    monkeypatch.setattr(triage, "triage_openai", _no_provider_call)
+    monkeypatch.setattr(sys, "argv", ["triage.py", "--batch", directory])
+    monkeypatch.setattr(sys, "stdin", ExplodingStdin())
+
+    assert triage.main() == 7
+    assert seen == [directory]
+
+
+def test_batch_missing_directory_fails_cleanly(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(triage, "triage_openai", _no_provider_call)
+    monkeypatch.setattr(sys, "argv", ["triage.py", "--batch", str(tmp_path / "missing"), "--json"])
+    monkeypatch.setattr(sys, "stdin", ExplodingStdin())
+
+    assert triage.main() == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "Batch directory does not exist" in err
+    assert "Traceback" not in err

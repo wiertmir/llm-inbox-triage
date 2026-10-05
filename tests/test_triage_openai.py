@@ -2,8 +2,8 @@
 
 Acceptance criteria from the issue:
   - Use the OpenAI Python SDK with the Responses API.
-  - The output shape is the Pydantic model `TriageResult`.
-  - Call `await client.responses.parse(model=..., input=[system, user], text_format=TriageResult)`.
+  - The output shape is the Pydantic model `TriageAnalysis`.
+  - Call `await client.responses.parse(model=..., input=[system, user], text_format=TriageAnalysis)`.
   - Return `response.output_parsed` (already validated, no `json.loads`).
   - Handle `output_parsed is None` (a safety refusal) gracefully.
 
@@ -44,7 +44,7 @@ openai = pytest.importorskip("openai")
 # Fakes
 # ---------------------------------------------------------------------------
 
-def make_result(**overrides) -> triage.TriageResult:
+def make_result(**overrides) -> triage.TriageAnalysis:
     data: dict[str, Any] = dict(
         category=triage.Category.invoice,
         priority=4,
@@ -58,7 +58,7 @@ def make_result(**overrides) -> triage.TriageResult:
         ),
     )
     data.update(overrides)
-    return triage.TriageResult(**data)
+    return triage.TriageAnalysis(**data)
 
 
 def parsed_response(result):
@@ -138,6 +138,9 @@ class FakeOpenAI:
         self.chat = _Chat()
         type(self).instances.append(self)
 
+    async def close(self):
+        pass
+
     @classmethod
     def all_parse_calls(cls):
         return [call for inst in cls.instances for call in inst.parse_calls]
@@ -164,15 +167,15 @@ def single_parse_call(fake):
 
 
 # ---------------------------------------------------------------------------
-# 1. The schema: TriageResult is a Pydantic model usable with Structured Outputs
+# 1. The schema: TriageAnalysis is a Pydantic model usable with Structured Outputs
 # ---------------------------------------------------------------------------
 
 def test_triage_result_is_pydantic_model():
-    assert issubclass(triage.TriageResult, BaseModel)
+    assert issubclass(triage.TriageAnalysis, BaseModel)
 
 
 def test_schema_has_expected_fields():
-    fields = set(triage.TriageResult.model_fields)
+    fields = set(triage.TriageAnalysis.model_fields)
     assert fields == {"category", "priority", "summary", "suggested_reply", "extracted", "proposed_events"}
     assert set(triage.Extracted.model_fields) == {"dates", "amounts", "names", "deadlines"}
 
@@ -181,7 +184,7 @@ def test_schema_converts_to_openai_strict_json_schema():
     """responses.parse() converts the model to a strict schema; it must not choke on it."""
     from openai.lib._pydantic import to_strict_json_schema
 
-    schema = to_strict_json_schema(triage.TriageResult)
+    schema = to_strict_json_schema(triage.TriageAnalysis)
 
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(schema["properties"])
@@ -200,7 +203,7 @@ def test_priority_in_range_accepted(priority):
 
 def test_hallucinated_category_rejected():
     with pytest.raises(ValidationError):
-        triage.TriageResult.model_validate(
+        triage.TriageAnalysis.model_validate(
             {**make_result().model_dump(), "category": "super-urgent"}
         )
 
@@ -269,7 +272,7 @@ def test_money_default_is_kept_out_of_strict_schema():
     """Strict mode requires every field, so a `default` in the API schema is meaningless."""
     from openai.lib._pydantic import to_strict_json_schema
 
-    money = to_strict_json_schema(triage.TriageResult)["$defs"]["Money"]
+    money = to_strict_json_schema(triage.TriageAnalysis)["$defs"]["Money"]
 
     assert "default" not in money["properties"]["currency"]
     assert set(money["required"]) == {"amount", "currency"}
@@ -288,7 +291,7 @@ def test_calls_responses_parse_once(fake_openai):
 def test_passes_triage_result_as_text_format(fake_openai):
     asyncio.run(triage.triage_openai("hello"))
 
-    assert single_parse_call(fake_openai)["text_format"] is triage.TriageResult
+    assert single_parse_call(fake_openai)["text_format"] is triage.TriageAnalysis
 
 
 def test_passes_a_model_name(fake_openai):
@@ -346,7 +349,7 @@ def test_system_prompt_names_default_currency():
 def test_returns_triage_result(fake_openai):
     result = asyncio.run(triage.triage_openai("hello"))
 
-    assert isinstance(result, triage.TriageResult)
+    assert isinstance(result, triage.TriageAnalysis)
 
 
 def test_returns_output_parsed_unchanged(fake_openai):
@@ -394,7 +397,7 @@ def test_none_output_parsed_does_not_return_none(fake_openai, response_factory):
     except Exception:
         return  # a deliberate, meaningful error is fine
     assert result is not None, "triage_openai() must not silently return None on refusal"
-    assert isinstance(result, triage.TriageResult)
+    assert isinstance(result, triage.TriageAnalysis)
 
 
 def test_refusal_error_is_explicit(fake_openai):
@@ -471,7 +474,7 @@ def test_main_json_output_matches_schema(fake_openai, monkeypatch, capsys):
 
     assert code == 0
     data = json.loads(captured.out)
-    assert triage.TriageResult.model_validate(data) == make_result()
+    assert triage.TriageAnalysis.model_validate(data) == make_result()
 
 
 def test_main_sends_file_contents_to_openai(fake_openai, monkeypatch, capsys):
@@ -494,7 +497,7 @@ def test_live_openai_on_sample():
 
     result = asyncio.run(triage.triage_openai(text))
 
-    assert isinstance(result, triage.TriageResult)
+    assert isinstance(result, triage.TriageAnalysis)
     assert result.category == triage.Category.invoice
     assert 1 <= result.priority <= 5
     assert result.summary.strip()

@@ -1,0 +1,5 @@
+Subject: Your subscribed engineering digest
+
+Here is the engineering newsletter you subscribed to. This edition discusses
+release checklists, documentation habits, and small-team code reviews.
+It is an informational digest; no reply or action is requested.

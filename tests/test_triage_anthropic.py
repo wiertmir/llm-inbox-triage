@@ -2,11 +2,11 @@
 
 Acceptance criteria from the issue:
   - Use the anthropic SDK with `system=SYSTEM_PROMPT`.
-  - Turn Claude's reply into a validated `TriageResult`.
+  - Turn Claude's reply into a validated `TriageAnalysis`.
   - `--provider anthropic` gives results equivalent to openai.
 
 The issue says "parse the returned text as JSON", while triage.py suggests a forced
-tool whose input_schema is TriageResult's JSON schema. The fake client answers
+tool whose input_schema is TriageAnalysis's JSON schema. The fake client answers
 whichever way it is called:
   - messages.create(tools=[...])         -> a tool_use block with the result as input
   - messages.create() without tools      -> a text block containing the JSON
@@ -46,7 +46,7 @@ anthropic = pytest.importorskip("anthropic")
 # Fakes
 # ---------------------------------------------------------------------------
 
-def make_result(**overrides) -> triage.TriageResult:
+def make_result(**overrides) -> triage.TriageAnalysis:
     data: dict[str, Any] = dict(
         category=triage.Category.invoice,
         priority=3,
@@ -60,7 +60,7 @@ def make_result(**overrides) -> triage.TriageResult:
         ),
     )
     data.update(overrides)
-    return triage.TriageResult(**data)
+    return triage.TriageAnalysis(**data)
 
 
 def make_payload(**overrides) -> dict:
@@ -113,6 +113,9 @@ class FakeAnthropic:
         self.messages = _Messages(self)
         type(self).instances.append(self)
 
+    async def close(self):
+        pass
+
     @classmethod
     def all_calls(cls):
         return [call for inst in cls.instances for call in inst.calls]
@@ -126,7 +129,7 @@ class FakeAnthropic:
 
         if method == "parse":
             # The real SDK validates too, so invalid output raises ValidationError here.
-            parsed = triage.TriageResult.model_validate(cls.payload)
+            parsed = triage.TriageAnalysis.model_validate(cls.payload)
             block = SimpleNamespace(type="text", text=json.dumps(cls.payload), parsed_output=parsed)
             return message([block], "end_turn", parsed=parsed)
 
@@ -252,7 +255,7 @@ def test_single_tool_built_from_triage_result_schema(fake_anthropic):
     tools = list(forced_tool_kwargs(fake_anthropic)["tools"])
     assert len(tools) == 1
     schema = tools[0]["input_schema"]
-    assert set(schema["properties"]) == set(triage.TriageResult.model_fields)
+    assert set(schema["properties"]) == set(triage.TriageAnalysis.model_fields)
     assert {"category", "priority", "summary", "extracted"} <= set(schema.get("required", []))
 
 
@@ -277,13 +280,13 @@ def test_text_before_tool_use_is_ignored(fake_anthropic):
 
 
 # ---------------------------------------------------------------------------
-# 3. The result: a validated TriageResult, equivalent to OpenAI's
+# 3. The result: a validated TriageAnalysis, equivalent to OpenAI's
 # ---------------------------------------------------------------------------
 
 def test_returns_triage_result(fake_anthropic):
     result = asyncio.run(triage.triage_anthropic("hello"))
 
-    assert isinstance(result, triage.TriageResult)
+    assert isinstance(result, triage.TriageAnalysis)
     assert isinstance(result.category, triage.Category)
     assert isinstance(result.extracted, triage.Extracted)
 
@@ -365,8 +368,11 @@ def test_equivalent_to_openai_for_the_same_output(fake_anthropic, monkeypatch):
 
         async def _parse(self, **_):
             return SimpleNamespace(
-                output_parsed=triage.TriageResult.model_validate(payload), output=[]
+                output_parsed=triage.TriageAnalysis.model_validate(payload), output=[]
             )
+
+        async def close(self):
+            pass
 
     openai = pytest.importorskip("openai")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-a-real-key")
@@ -438,7 +444,7 @@ def test_cli_json_output_matches_schema(fake_anthropic, monkeypatch, capsys):
 
     assert code == 0
     data = json.loads(captured.out)
-    assert triage.TriageResult.model_validate(data) == make_result()
+    assert triage.TriageAnalysis.model_validate(data) == make_result()
 
 
 def test_cli_sends_file_contents_to_claude(fake_anthropic, monkeypatch, capsys):
@@ -491,7 +497,7 @@ def test_live_anthropic_on_sample():
 
     result = asyncio.run(triage.triage_anthropic(text))
 
-    assert isinstance(result, triage.TriageResult)
+    assert isinstance(result, triage.TriageAnalysis)
     assert result.category == triage.Category.invoice
     assert 1 <= result.priority <= 5
     assert result.summary.strip()

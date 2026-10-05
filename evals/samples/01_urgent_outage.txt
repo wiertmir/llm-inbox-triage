@@ -1,0 +1,5 @@
+Subject: Production checkout outage - immediate action needed
+
+All customers are currently unable to complete checkout. Please investigate
+the failed deployment and restore service immediately. This is a live
+production incident, not a routine maintenance request.

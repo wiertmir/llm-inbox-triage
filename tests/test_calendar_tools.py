@@ -27,6 +27,7 @@ def event_arguments(**overrides):
 
 def make_result(*, proposals=True, **overrides):
     data = {
+        "id": "***stdin***",
         "category": triage.Category.other, "priority": 3, "summary": "Planning on October 5.",
         "extracted": triage.Extracted(dates=[date(2026, 10, 5)]),
         "proposed_events": [event_arguments()] if proposals else [],
@@ -181,7 +182,7 @@ def test_cli_runs_one_provider_request_and_creates_from_its_result(
 
     async def parse(**kwargs):
         calls.append(kwargs)
-        assert kwargs.get("text_format", kwargs.get("output_format")) is triage.TriageResult
+        assert kwargs.get("text_format", kwargs.get("output_format")) is triage.TriageAnalysis
         return SimpleNamespace(
             output_parsed=result, parsed_output=result, stop_reason="end_turn",
         )
@@ -191,6 +192,9 @@ def test_cli_runs_one_provider_request_and_creates_from_its_result(
             self.base_url = "https://example.com/"
             self.responses = SimpleNamespace(parse=parse)
             self.messages = SimpleNamespace(parse=parse)
+
+        async def close(self):
+            pass
 
     monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")

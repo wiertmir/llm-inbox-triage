@@ -1,0 +1,5 @@
+Subject: Active unauthorized access - revoke sessions now
+
+We have confirmed that an unauthorized user is accessing our customer records
+right now. Please revoke all active sessions for the compromised account and
+contact the incident response team immediately.

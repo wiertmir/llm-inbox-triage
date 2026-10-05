@@ -180,6 +180,7 @@ MALFORMED = [
 
 def make_result() -> triage.TriageResult:
     return triage.TriageResult(
+        id="***stdin***",
         category=triage.Category.invoice,
         priority=3,
         summary="Invoice #4471 for 128,000 JPY is due on August 31, 2026.",
@@ -240,6 +241,9 @@ def fake_openai_class(script):
         async def _call(self, **kwargs):
             return _openai_reply(script.next())
 
+        async def close(self):
+            pass
+
         def with_options(self, **kwargs):
             return self
 
@@ -254,6 +258,9 @@ def fake_anthropic_class(script):
 
         async def _call(self, **kwargs):
             return _anthropic_reply(script.next())
+
+        async def close(self):
+            pass
 
         def with_options(self, **kwargs):
             return self

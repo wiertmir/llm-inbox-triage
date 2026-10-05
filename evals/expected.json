@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "samples": [
+    {
+      "id": "01_urgent_outage",
+      "file": "samples/01_urgent_outage.txt",
+      "expected": {
+        "category": "urgent",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "02_urgent_access",
+      "file": "samples/02_urgent_access.txt",
+      "expected": {
+        "category": "urgent",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "03_urgent_deadline",
+      "file": "samples/03_urgent_deadline.txt",
+      "expected": {
+        "category": "urgent",
+        "extracted": {
+          "dates": ["2026-11-02", "2026-11-03"],
+          "amounts": [],
+          "names": [],
+          "deadlines": ["2026-11-03"]
+        }
+      }
+    },
+    {
+      "id": "04_invoice_jpy",
+      "file": "samples/04_invoice_jpy.txt",
+      "expected": {
+        "category": "invoice",
+        "extracted": {
+          "dates": ["2026-11-15"],
+          "amounts": [{"amount": 42500, "currency": "JPY"}],
+          "names": ["Northstar Hosting"],
+          "deadlines": ["2026-11-15"]
+        }
+      }
+    },
+    {
+      "id": "05_invoice_usd",
+      "file": "samples/05_invoice_usd.txt",
+      "expected": {
+        "category": "invoice",
+        "extracted": {
+          "dates": ["2026-11-20"],
+          "amounts": [{"amount": 750, "currency": "USD"}],
+          "names": ["Elena Brooks"],
+          "deadlines": ["2026-11-20"]
+        }
+      }
+    },
+    {
+      "id": "06_invoice_default_currency",
+      "file": "samples/06_invoice_default_currency.txt",
+      "expected": {
+        "category": "invoice",
+        "extracted": {
+          "dates": ["2026-12-01"],
+          "amounts": [{"amount": 18000, "currency": "JPY"}],
+          "names": ["Willow Rentals"],
+          "deadlines": ["2026-12-01"]
+        }
+      }
+    },
+    {
+      "id": "07_spam_prize",
+      "file": "samples/07_spam_prize.txt",
+      "expected": {
+        "category": "spam",
+        "extracted": {
+          "dates": [],
+          "amounts": [{"amount": 10000, "currency": "USD"}],
+          "names": [],
+          "deadlines": []
+        }
+      }
+    },
+    {
+      "id": "08_spam_bulk_ad",
+      "file": "samples/08_spam_bulk_ad.txt",
+      "expected": {
+        "category": "spam",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "09_spam_fake_offer",
+      "file": "samples/09_spam_fake_offer.txt",
+      "expected": {
+        "category": "spam",
+        "extracted": {
+          "dates": [],
+          "amounts": [{"amount": 500, "currency": "EUR"}],
+          "names": [],
+          "deadlines": []
+        }
+      }
+    },
+    {
+      "id": "10_question_export",
+      "file": "samples/10_question_export.txt",
+      "expected": {
+        "category": "question",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "11_question_meeting",
+      "file": "samples/11_question_meeting.txt",
+      "expected": {
+        "category": "question",
+        "extracted": {
+          "dates": ["2026-11-18"],
+          "amounts": [],
+          "names": ["Priya Shah"],
+          "deadlines": []
+        }
+      }
+    },
+    {
+      "id": "12_question_quote",
+      "file": "samples/12_question_quote.txt",
+      "expected": {
+        "category": "question",
+        "extracted": {
+          "dates": [],
+          "amounts": [
+            {"amount": 120, "currency": "EUR"},
+            {"amount": 180, "currency": "EUR"}
+          ],
+          "names": ["Maple Studio"],
+          "deadlines": []
+        }
+      }
+    },
+    {
+      "id": "13_newsletter_digest",
+      "file": "samples/13_newsletter_digest.txt",
+      "expected": {
+        "category": "newsletter",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "14_newsletter_webinar",
+      "file": "samples/14_newsletter_webinar.txt",
+      "expected": {
+        "category": "newsletter",
+        "extracted": {
+          "dates": ["2026-12-04"],
+          "amounts": [],
+          "names": ["Harbor Analytics"],
+          "deadlines": []
+        }
+      }
+    },
+    {
+      "id": "15_newsletter_roundup",
+      "file": "samples/15_newsletter_roundup.txt",
+      "expected": {
+        "category": "newsletter",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "16_ignore_test",
+      "file": "samples/16_ignore_test.txt",
+      "expected": {
+        "category": "ignore",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "17_ignore_resolved",
+      "file": "samples/17_ignore_resolved.txt",
+      "expected": {
+        "category": "ignore",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "18_ignore_duplicate",
+      "file": "samples/18_ignore_duplicate.txt",
+      "expected": {
+        "category": "ignore",
+        "extracted": {"dates": [], "amounts": [], "names": [], "deadlines": []}
+      }
+    },
+    {
+      "id": "19_other_handover",
+      "file": "samples/19_other_handover.txt",
+      "expected": {
+        "category": "other",
+        "extracted": {
+          "dates": [],
+          "amounts": [],
+          "names": ["Maya Ortiz", "Cedar Labs"],
+          "deadlines": []
+        }
+      }
+    },
+    {
+      "id": "20_other_thanks",
+      "file": "samples/20_other_thanks.txt",
+      "expected": {
+        "category": "other",
+        "extracted": {
+          "dates": [],
+          "amounts": [],
+          "names": ["Leo Martin", "Silver Fern Works"],
+          "deadlines": []
+        }
+      }
+    }
+  ]
+}
